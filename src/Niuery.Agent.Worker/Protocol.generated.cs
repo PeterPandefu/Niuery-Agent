@@ -2,4 +2,4 @@
 using System.Text.Json;
 namespace Niuery.Agent.Worker;
 public sealed record Request(int Version, string RequestId, string Method, JsonElement Payload);
-public static class Protocol { public static readonly string[] Methods = ["hello", "providers.list", "history.list", "events.list", "run.start", "run.cancel", "run.continue", "approval.respond", "workspace.diff", "artifact.undo", "worker.shutdown"]; }
+public static class Protocol { public static readonly string[] Methods = ["hello", "providers.list", "history.list", "events.list", "run.start", "run.cancel", "run.continue", "approval.respond", "workspace.diff", "workspace.read", "workspace.apply", "workspace.command", "artifact.undo", "worktree.create", "worktree.remove", "worker.shutdown"]; }

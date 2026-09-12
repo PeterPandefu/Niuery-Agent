@@ -1,0 +1,2 @@
+import fs from 'node:fs';import path from 'node:path';
+const tasks=JSON.parse(fs.readFileSync(path.resolve('evals/tasks.json'),'utf8'));if(tasks.length!==30)throw new Error('评测集必须包含 30 个任务');if(new Set(tasks.map(t=>t.id)).size!==30)throw new Error('评测 ID 必须唯一');for(const t of tasks)if(!t.id||!t.category||!t.prompt)throw new Error('评测任务字段不完整');console.log(JSON.stringify({status:'通过',taskCount:tasks.length,categories:[...new Set(tasks.map(t=>t.category))]}));

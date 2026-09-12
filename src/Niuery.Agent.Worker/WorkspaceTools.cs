@@ -105,7 +105,7 @@ public sealed class WorkspaceTools(string root, Func<string, object, Cancellatio
             Directory.CreateDirectory(Path.GetDirectoryName(full)!);
             await File.WriteAllTextAsync(full, after, new UTF8Encoding(false), runToken);
             var artifactId = Guid.NewGuid().ToString("N");
-            emit("artifact.created", new { artifactId, path, before, after, existed, hash = Hash(after), message = $"已修改文件：{path}" });
+            emit("artifact.created", new { artifactId, workspace, path, before, after, existed, hash = Hash(after), message = $"已修改文件：{path}" });
             return new { path, hash = Hash(after), artifactId };
         }
         finally { mutations.Release(); }

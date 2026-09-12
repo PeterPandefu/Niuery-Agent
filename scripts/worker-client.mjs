@@ -16,7 +16,7 @@ export class WorkerClient {
     });
     this.process.stderr.on('data',()=>{});
   }
-  request(method,payload={}){return new Promise((resolve,reject)=>{const requestId=randomUUID();const timer=setTimeout(()=>{this.pending.delete(requestId);reject(new Error('请求超时。'));},15000);this.pending.set(requestId,{resolve,reject,timer});this.process.stdin.write(JSON.stringify({version:1,requestId,method,payload})+'\n');});}
+  request(method,payload={},timeoutMs=15000){return new Promise((resolve,reject)=>{const requestId=randomUUID();const timer=setTimeout(()=>{this.pending.delete(requestId);reject(new Error('请求超时。'));},timeoutMs);this.pending.set(requestId,{resolve,reject,timer});this.process.stdin.write(JSON.stringify({version:1,requestId,method,payload})+'\n');});}
   waitFor(predicate,timeout=180000){const existing=this.events.find(predicate);if(existing)return Promise.resolve(existing);return new Promise((resolve,reject)=>{const observer=e=>{if(predicate(e)){clearTimeout(timer);this.observers=this.observers.filter(x=>x!==observer);resolve(e);}};const timer=setTimeout(()=>{this.observers=this.observers.filter(x=>x!==observer);reject(new Error('等待执行事件超时。'));},timeout);this.observers.push(observer);});}
   async close(){if(this.process.exitCode===null){await this.request('worker.shutdown').catch(()=>{});this.process.stdin.end();await this.exit;}}
 }
