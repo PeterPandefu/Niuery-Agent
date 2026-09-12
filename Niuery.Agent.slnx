@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Niuery.Agent.Diagnostics/Niuery.Agent.Diagnostics.csproj" />
+    <Project Path="src/Niuery.Agent.Runtime.Maf/Niuery.Agent.Runtime.Maf.csproj" />
+    <Project Path="src/Niuery.Agent.Worker/Niuery.Agent.Worker.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Niuery.Agent.Runtime.Tests/Niuery.Agent.Runtime.Tests.csproj" />
+  </Folder>
+</Solution>
