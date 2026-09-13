@@ -1,0 +1,30 @@
+name: 持续集成
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      - name: 安装 .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: 恢复依赖
+        run: dotnet restore Niuery.Agent.slnx --locked-mode
+      - name: 构建 .NET
+        run: dotnet build Niuery.Agent.slnx --no-restore --configuration Release
+      - name: 运行 .NET 测试
+        run: dotnet test Niuery.Agent.slnx --no-build --configuration Release
+      - name: 安装桌面端依赖
+        working-directory: apps/desktop
+        run: npm ci
+      - name: 构建桌面端
+        working-directory: apps/desktop
+        run: npm run build
+      - name: 校验评测集
+        run: node scripts/validate-evals.mjs

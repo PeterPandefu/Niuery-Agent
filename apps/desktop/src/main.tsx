@@ -2,7 +2,6 @@ import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "re
 import { createRoot } from "react-dom/client";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import mermaid from "mermaid";
 import { diffLines } from "diff";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
@@ -149,6 +148,7 @@ const eventText: Record<string, string> = {
   "approval.resolved": "审批已处理",
   "command.completed": "命令执行完成",
   "command.failed": "命令执行失败",
+  "command.cancelled": "命令已取消",
   "mode.changed": "运行模式已切换",
   "session.restored": "已恢复任务会话",
   "session.restore.failed": "任务会话恢复失败，已创建新会话",
@@ -286,13 +286,11 @@ function MermaidDiagram({ chart }: { chart: string }) {
   useEffect(() => {
     let cancelled = false;
     setError("");
-    mermaid.initialize({
-      startOnLoad: false,
-      securityLevel: "strict",
-      theme: "base",
-    });
-    mermaid
-      .render(diagramId, chart)
+    import("mermaid")
+      .then(({ default: mermaid }) => {
+        mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "base" });
+        return mermaid.render(diagramId, chart);
+      })
       .then(({ svg, bindFunctions }) => {
         if (cancelled || !containerRef.current) return;
         containerRef.current.innerHTML = svg;

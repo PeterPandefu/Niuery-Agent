@@ -26,13 +26,14 @@ public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration>
     private IReadOnlyList<ProviderConfiguration> providers = initialProviders;
     private readonly Func<ProviderConfiguration, IChatClient> clientFactory = clientFactory ?? HarnessFactory.CreateClient;
     private readonly ConcurrentDictionary<string, (CancellationTokenSource Cancellation, Task Work)> active = new();
+    private readonly ConcurrentDictionary<string, CancellationTokenSource> operationCancellations = new();
     private ApprovalGate? approvalGate;
     private ApprovalGate Approvals => approvalGate ??= new ApprovalGate((id, type, body) => Emit(id, type, body));
     public async Task<object> Handle(string method, JsonElement payload)
     {
         object result = method switch
         {
-            "hello" => new { version = 1, name = "Niuery Agent", capabilities = new[] { "streaming", "cancel", "history", "project.open", "chat.start", "mode.get", "mode.set", "workspace.diff", "workspace.gitDiff", "workspace.tree", "workspace.read", "workspace.apply", "workspace.command", "artifact.undo" } },
+            "hello" => new { version = 1, eventSchemaVersion = 1, name = "Niuery Agent", capabilities = new[] { "streaming", "cancel", "history", "project.open", "chat.start", "mode.get", "mode.set", "workspace.diff", "workspace.gitDiff", "workspace.tree", "workspace.read", "workspace.apply", "workspace.command", "artifact.undo", "worktree.create", "worktree.remove", "worker.shutdown" } },
             "project.open" => await OpenProject(payload),
             "providers.list" => providers.Select(p => new { p.Id, p.Kind, p.BaseUrl, p.Model, Models = p.AvailableModels, p.ApiKey, p.SupportsTools, p.SupportsStreaming, p.TimeoutSeconds, p.Enabled, p.Transport, p.ReasoningOutput }).ToArray(),
             "providers.save" => await SaveProviders(payload),
@@ -95,7 +96,7 @@ public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration>
         var url = new Uri(new Uri(p.BaseUrl.EndsWith('/') ? p.BaseUrl : p.BaseUrl + "/"), "models");
         try
         {
-            var response = await client.GetAsync(url);
+            using var response = await SendWithRetry(client, url);
             return new
             {
                 ok = response.IsSuccessStatusCode,
@@ -116,13 +117,35 @@ public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration>
     }
     private static async Task<object> SyncProvider(JsonElement payload)
     {
-        var p = JsonSerializer.Deserialize<ProviderConfiguration>(payload.GetProperty("provider"), new JsonSerializerOptions(JsonSerializerDefaults.Web)) ?? throw new InvalidOperationException("提供商参数无效。"); p.Validate(false); using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(Math.Min(p.TimeoutSeconds, 15)) }; var apiKey = p.Kind == "ollama" ? "ollama" : p.ResolveApiKey(false); if (p.Kind == "openai-compatible") client.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey); var url = new Uri(new Uri(p.BaseUrl.EndsWith('/') ? p.BaseUrl : p.BaseUrl + "/"), "models"); var json = await client.GetStringAsync(url); using var doc = JsonDocument.Parse(json); var models = doc.RootElement.TryGetProperty("data", out var data) ? data.EnumerateArray().Select(x => x.TryGetProperty("id", out var id) ? id.GetString() : null).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct(StringComparer.Ordinal).ToArray() : Array.Empty<string>(); return new { models };
+        var p = JsonSerializer.Deserialize<ProviderConfiguration>(payload.GetProperty("provider"), new JsonSerializerOptions(JsonSerializerDefaults.Web)) ?? throw new InvalidOperationException("提供商参数无效。"); p.Validate(false); using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(Math.Min(p.TimeoutSeconds, 15)) }; var apiKey = p.Kind == "ollama" ? "ollama" : p.ResolveApiKey(false); if (p.Kind == "openai-compatible") client.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey); var url = new Uri(new Uri(p.BaseUrl.EndsWith('/') ? p.BaseUrl : p.BaseUrl + "/"), "models"); using var response = await SendWithRetry(client, url); response.EnsureSuccessStatusCode(); var json = await response.Content.ReadAsStringAsync(); using var doc = JsonDocument.Parse(json); var models = doc.RootElement.TryGetProperty("data", out var data) ? data.EnumerateArray().Select(x => x.TryGetProperty("id", out var id) ? id.GetString() : null).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct(StringComparer.Ordinal).ToArray() : Array.Empty<string>(); return new { models };
+    }
+    private static async Task<HttpResponseMessage> SendWithRetry(HttpClient client, Uri url)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                var response = await client.GetAsync(url);
+                if (attempt < 2 && ((int)response.StatusCode == 429 || (int)response.StatusCode >= 500))
+                {
+                    response.Dispose();
+                    await Task.Delay(TimeSpan.FromMilliseconds(250 * (attempt + 1)));
+                    continue;
+                }
+                return response;
+            }
+            catch (HttpRequestException) when (attempt < 2)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(250 * (attempt + 1)));
+            }
+        }
     }
     private static async Task<object> RemoveWorktree(JsonElement payload)
     { await WorktreeManager.RemoveAsync(payload.Required("repository"), payload.Required("path"), CancellationToken.None); return new { removed = true }; }
     private object Cancel(string id)
     {
         if (active.TryGetValue(id, out var run)) run.Cancellation.Cancel();
+        if (operationCancellations.TryGetValue(id, out var operation)) operation.Cancel();
         return new { accepted = true };
     }
     private object DeleteTask(string taskId)
@@ -158,21 +181,35 @@ public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration>
     private object BeginCommand(JsonElement payload)
     {
         var copy = payload.Clone();
+        var runId = copy.Required("runId");
+        var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(90));
+        operationCancellations[runId] = cancellation;
         _ = Task.Run(async () =>
         {
-            var runId = copy.Required("runId");
             try
             {
                 var root = Path.GetFullPath(copy.Required("workspace"));
                 var executable = copy.Required("executable");
                 var arguments = copy.GetProperty("arguments").EnumerateArray().Select(x => x.GetString() ?? "").ToArray();
-                await Approvals.Require(runId, "运行命令", new { executable, arguments, root }, CancellationToken.None);
-                var result = await WorkspaceTools.Execute(executable, arguments, root, CancellationToken.None);
+                ValidateCommandPolicy(executable, arguments);
+                await Approvals.Require(runId, "运行命令", new { executable, arguments, root }, cancellation.Token);
+                var result = await WorkspaceTools.Execute(executable, arguments, root, cancellation.Token);
                 Emit(runId, "command.completed", new { result.ExitCode, result.Output, result.Truncated, message = $"命令完成，退出码 {result.ExitCode}" });
             }
+            catch (OperationCanceledException) { Emit(runId, "command.cancelled", new { message = "命令已取消。" }); }
             catch (Exception) { Emit(runId, "command.failed", new { message = "命令执行失败或被拒绝。" }); }
+            finally { operationCancellations.TryRemove(runId, out _); cancellation.Dispose(); }
         });
         return new { accepted = true };
+    }
+    private static void ValidateCommandPolicy(string executable, IReadOnlyList<string> arguments)
+    {
+        var name = Path.GetFileNameWithoutExtension(executable).ToLowerInvariant();
+        var allowed = new[] { "dotnet", "git", "npm", "node", "pwsh", "powershell" };
+        if (!allowed.Contains(name, StringComparer.OrdinalIgnoreCase)) throw new InvalidOperationException("该命令不在允许列表中。");
+        var joined = string.Join(" ", arguments);
+        var blocked = new[] { "rm -rf", "rmdir /s", "del /s", "format ", "shutdown", "reg delete", "credential", ".ssh", ".env" };
+        if (blocked.Any(token => joined.Contains(token, StringComparison.OrdinalIgnoreCase))) throw new InvalidOperationException("命令参数触发了安全策略。");
     }
     private async Task<object> Undo(JsonElement payload)
     {
@@ -368,7 +405,7 @@ public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration>
     private void Emit(string runId, string type, object payload, string? status = null)
     {
         var item = store.Append(runId, type, payload, status);
-        Wire.Send(new { version = 1, eventData = item });
+        Wire.Send(new { version = 1, eventSchemaVersion = 1, eventData = item });
     }
     private async Task Run(RunRow row, ProviderConfiguration provider, CancellationToken token)
     {

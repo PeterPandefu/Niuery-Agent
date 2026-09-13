@@ -12,7 +12,7 @@ public sealed class Store : IDisposable
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
         connection = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = path }.ToString());
         connection.Open();
-        Execute("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY, taskId TEXT NOT NULL, parentId TEXT, workspace TEXT NOT NULL DEFAULT '', prompt TEXT NOT NULL, provider TEXT NOT NULL, status TEXT NOT NULL, created TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'project'); CREATE TABLE IF NOT EXISTS events(runId TEXT NOT NULL, sequence INTEGER NOT NULL, type TEXT NOT NULL, timestamp TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(runId,sequence)); CREATE TABLE IF NOT EXISTS task_state(taskId TEXT PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'execute', sessionJson TEXT, updatedAt TEXT NOT NULL);");
+        Execute("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY, taskId TEXT NOT NULL, parentId TEXT, workspace TEXT NOT NULL DEFAULT '', prompt TEXT NOT NULL, provider TEXT NOT NULL, status TEXT NOT NULL, created TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'project'); CREATE TABLE IF NOT EXISTS events(runId TEXT NOT NULL, sequence INTEGER NOT NULL, type TEXT NOT NULL, timestamp TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(runId,sequence)); CREATE TABLE IF NOT EXISTS task_state(taskId TEXT PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'execute', sessionJson TEXT, updatedAt TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_runs_created ON runs(created DESC); CREATE INDEX IF NOT EXISTS idx_runs_task ON runs(taskId); CREATE INDEX IF NOT EXISTS idx_events_run_type ON events(runId,type);");
         try { Execute("ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'project'"); } catch (SqliteException) { }
         foreach (var run in History().Where(r => r.Status == "running"))
             Append(run.Id, "run.interrupted", new { message = "执行器退出，执行已中断。继续前请检查工作区差异。" }, "interrupted");
@@ -100,6 +100,8 @@ public sealed class Store : IDisposable
             var sequence = Convert.ToInt64(cmd.ExecuteScalar());
             var timestamp = DateTimeOffset.UtcNow.ToString("O");
             var element = JsonSerializer.SerializeToElement(payload, Wire.Json);
+            if (element.GetRawText().Length > 256_000)
+                throw new InvalidOperationException("事件内容超过 256 KB 上限。");
             cmd.CommandText = "INSERT INTO events VALUES($id,$sequence,$type,$timestamp,$payload)";
             cmd.Parameters.AddWithValue("$sequence", sequence); cmd.Parameters.AddWithValue("$type", type);
             cmd.Parameters.AddWithValue("$timestamp", timestamp); cmd.Parameters.AddWithValue("$payload", element.GetRawText()); cmd.ExecuteNonQuery();
