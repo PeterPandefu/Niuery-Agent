@@ -9,6 +9,7 @@
     "start": "electron .",
     "dev": "vite --host 127.0.0.1",
     "test:desktop": "node scripts/smoke.cjs",
+    "test:ipc-allowlist": "node scripts/ipc-allowlist.cjs",
     "test:conversation": "node scripts/conversation.cjs",
     "test:project-continuation": "node scripts/project-continuation.cjs"
   },

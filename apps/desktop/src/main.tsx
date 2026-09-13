@@ -1026,12 +1026,17 @@ function App() {
               onKeyDown={(e) => {
                 if (
                   e.key === "Enter" &&
-                  (e.ctrlKey || e.metaKey) &&
+                  !e.shiftKey &&
+                  !e.nativeEvent.isComposing &&
                   prompt.trim() &&
                   (composeKind === "chat" || workspace) &&
+                  (!current || canContinue) &&
+                  !busy &&
                   !running
-                )
+                ) {
+                  e.preventDefault();
                   current ? continueTask() : start();
+                }
               }}
             />
               <div className="composer-toolbar">
@@ -1074,12 +1079,12 @@ function App() {
               </label>
               <span className="composer-hint">
                 {composeKind === "chat"
-                  ? "Chat 对话 · Ctrl + Enter 发送"
+                  ? "Chat 对话 · Enter 发送，Shift + Enter 换行"
                   : !workspace
                   ? "先选择一个项目"
                   : current && !canContinue
                     ? "只有已完成或中断的任务可以继续"
-                    : "Ctrl + Enter 发送"}
+                    : "Enter 发送，Shift + Enter 换行"}
               </span>
               {current && workMode === "plan" && canContinue && !running && (
                 <button
