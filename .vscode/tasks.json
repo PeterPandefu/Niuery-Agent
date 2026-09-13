@@ -1,0 +1,27 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "构建 Worker",
+      "type": "process",
+      "command": "dotnet",
+      "args": ["build", "${workspaceFolder}/src/Niuery.Agent.Worker/Niuery.Agent.Worker.csproj"],
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "构建 Diagnostics",
+      "type": "process",
+      "command": "dotnet",
+      "args": ["build", "${workspaceFolder}/src/Niuery.Agent.Diagnostics/Niuery.Agent.Diagnostics.csproj"],
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "构建桌面前端",
+      "type": "process",
+      "command": "npm",
+      "args": ["run", "build"],
+      "options": { "cwd": "${workspaceFolder}/apps/desktop" },
+      "problemMatcher": "$tsc"
+    }
+  ]
+}

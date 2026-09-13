@@ -5,7 +5,9 @@
       "kind": "openai-compatible",
       "baseUrl": "https://example.com/v1/",
       "model": "请填写实际模型名",
-      "apiKeyEnvironmentVariable": "NIUERY_OPENAI_API_KEY",
+      "models": [],
+      "enabled": true,
+      "apiKey": "",
       "supportsTools": true,
       "supportsStreaming": true,
       "timeoutSeconds": 60
@@ -15,7 +17,9 @@
       "kind": "ollama",
       "baseUrl": "http://127.0.0.1:11434/v1/",
       "model": "请填写已安装且支持工具调用的模型名",
-      "apiKeyEnvironmentVariable": null,
+      "models": [],
+      "enabled": true,
+      "apiKey": "",
       "supportsTools": true,
       "supportsStreaming": true,
       "timeoutSeconds": 120

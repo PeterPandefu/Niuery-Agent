@@ -5,7 +5,7 @@ namespace Niuery.Agent.Runtime.Tests;
 
 public sealed class ProviderConfigurationTests
 {
-    private static ProviderConfiguration Valid => new("test", "openai-compatible", "https://models.example.org/v1/", "configured-model", "NIUERY_TEST_MISSING_KEY");
+    private static ProviderConfiguration Valid => new("test", "openai-compatible", "https://models.example.org/v1/", "configured-model", "test-api-key");
 
     [Theory(DisplayName = "拒绝不安全或夹带凭证的服务地址")]
     [InlineData("http://models.example.org/v1/")]
@@ -18,17 +18,17 @@ public sealed class ProviderConfigurationTests
     [Fact(DisplayName = "允许本机 Ollama 无凭证连接")]
     public void AllowLoopbackOllama()
     {
-        var config = Valid with { Kind = "ollama", BaseUrl = "http://127.0.0.1:11434/v1/", ApiKeyEnvironmentVariable = null };
+        var config = Valid with { Kind = "ollama", BaseUrl = "http://127.0.0.1:11434/v1/", ApiKey = null };
         Assert.True(config.Validate().IsLoopback);
         Assert.Equal("ollama", config.ResolveApiKey());
     }
 
-    [Fact(DisplayName = "缺少凭证明确报错且不泄露值")]
-    public void MissingCredentialIsActionable()
+    [Fact(DisplayName = "缺少 API Key 明确报错且不泄露值")]
+    public void MissingApiKeyIsActionable()
     {
-        var config = Valid with { ApiKeyEnvironmentVariable = $"NIUERY_MISSING_{Guid.NewGuid():N}" };
+        var config = Valid with { ApiKey = "" };
         var error = Assert.Throws<ConfigurationException>(() => config.ResolveApiKey());
-        Assert.Contains("环境变量", error.Message);
+        Assert.Contains("API Key", error.Message);
     }
 
     [Fact(DisplayName = "示例模型不能误报为真实配置")]

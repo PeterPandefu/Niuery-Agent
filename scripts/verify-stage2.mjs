@@ -3,7 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import assert from 'node:assert/strict';
 import { WorkerClient, root } from './worker-client.mjs';
-const directory=fs.mkdtempSync(path.join(os.tmpdir(),'niuery-stage2-'));const database=path.join(directory,'tasks.db');
+const directory=fs.mkdtempSync(path.join(os.tmpdir(),'niuery-stage2-'));fs.mkdirSync(path.join(directory,'.git'));const database=path.join(directory,'tasks.db');
 let worker=new WorkerClient(database);
 try{
  assert.equal((await worker.request('hello')).version,1);

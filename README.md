@@ -22,9 +22,9 @@ dotnet test Niuery.Agent.slnx --no-build
 
 ## 真实模型验收
 
-参照 `config/providers.example.json` 创建未跟踪的 `config/providers.local.json`。填写实际 Base URL、模型名和密钥环境变量名，不在文件内填写密钥。两个提供商编号示例为 `compatible` 和 `local`。
+参照 `config/providers.example.json` 创建未跟踪的 `config/providers.local.json`。填写实际 Base URL、模型名和 API Key。API Key 仅保存在本机配置文件中，不要提交到仓库或发送到聊天。两个提供商编号示例为 `compatible` 和 `local`。
 
-密钥在本机环境中配置；不要提交到仓库或发送到聊天。Ollama 需自行启动并准备支持工具调用的模型。本项目不会自动下载模型或猜测远程服务。
+Ollama 无需 API Key，需自行启动并准备支持工具调用的模型。本项目不会自动下载模型或猜测远程服务。
 
 ```powershell
 pwsh -File scripts/verify-stage1.ps1 -ProviderId compatible

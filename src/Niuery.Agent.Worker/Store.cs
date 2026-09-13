@@ -12,7 +12,8 @@ public sealed class Store : IDisposable
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
         connection = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = path }.ToString());
         connection.Open();
-        Execute("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY, taskId TEXT NOT NULL, parentId TEXT, workspace TEXT NOT NULL, prompt TEXT NOT NULL, provider TEXT NOT NULL, status TEXT NOT NULL, created TEXT NOT NULL); CREATE TABLE IF NOT EXISTS events(runId TEXT NOT NULL, sequence INTEGER NOT NULL, type TEXT NOT NULL, timestamp TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(runId,sequence));");
+        Execute("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY, taskId TEXT NOT NULL, parentId TEXT, workspace TEXT NOT NULL DEFAULT '', prompt TEXT NOT NULL, provider TEXT NOT NULL, status TEXT NOT NULL, created TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'project'); CREATE TABLE IF NOT EXISTS events(runId TEXT NOT NULL, sequence INTEGER NOT NULL, type TEXT NOT NULL, timestamp TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(runId,sequence));");
+        try { Execute("ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'project'"); } catch (SqliteException) { }
         foreach (var run in History().Where(r => r.Status == "running"))
             Append(run.Id, "run.interrupted", new { message = "执行器退出，执行已中断。继续前请检查工作区差异。" }, "interrupted");
     }
@@ -22,27 +23,42 @@ public sealed class Store : IDisposable
         foreach (var (key, value) in values) command.Parameters.AddWithValue(key, value ?? DBNull.Value);
         command.ExecuteNonQuery();
     }
-    public RunRow Create(string workspace, string prompt, string provider, string? parentId = null)
+    public RunRow Create(string kind, string workspace, string prompt, string provider, string? parentId = null)
     {
         lock (gate)
         {
             var parent = parentId is null ? null : History().SingleOrDefault(r => r.Id == parentId)
                 ?? throw new InvalidOperationException("找不到前序执行。");
             var row = new RunRow(Guid.NewGuid().ToString("N"), parent?.TaskId ?? Guid.NewGuid().ToString("N"), parentId,
-                workspace, prompt, provider, "running", DateTimeOffset.UtcNow.ToString("O"));
-            Execute("INSERT INTO runs VALUES($id,$task,$parent,$workspace,$prompt,$provider,$status,$created)",
+                kind, workspace, prompt, provider, "running", DateTimeOffset.UtcNow.ToString("O"));
+            Execute("INSERT INTO runs(id,taskId,parentId,workspace,prompt,provider,status,created,kind) VALUES($id,$task,$parent,$workspace,$prompt,$provider,$status,$created,$kind)",
                 ("$id", row.Id), ("$task", row.TaskId), ("$parent", parentId), ("$workspace", workspace), ("$prompt", prompt),
-                ("$provider", provider), ("$status", row.Status), ("$created", row.Created));
+                ("$provider", provider), ("$status", row.Status), ("$created", row.Created), ("$kind", kind));
             return row;
         }
     }
-    public List<RunRow> History()
+    public RunRow Create(string workspace, string prompt, string provider, string? parentId = null) => Create("project", workspace, prompt, provider, parentId);
+    public void DeleteTask(string taskId)
     {
         lock (gate)
         {
-            using var cmd = connection.CreateCommand(); cmd.CommandText = "SELECT * FROM runs ORDER BY created DESC LIMIT 200";
+            using var transaction = connection.BeginTransaction();
+            using var command = connection.CreateCommand(); command.Transaction = transaction;
+            command.CommandText = "DELETE FROM events WHERE runId IN (SELECT id FROM runs WHERE taskId=$taskId); DELETE FROM runs WHERE taskId=$taskId;";
+            command.Parameters.AddWithValue("$taskId", taskId);
+            command.ExecuteNonQuery();
+            transaction.Commit();
+        }
+    }
+    public List<RunRow> History(int limit = 200, int offset = 0)
+    {
+        lock (gate)
+        {
+            limit = Math.Clamp(limit, 1, 1000); offset = Math.Max(0, offset);
+            using var cmd = connection.CreateCommand(); cmd.CommandText = "SELECT id,taskId,parentId,workspace,prompt,provider,status,created,kind FROM runs ORDER BY created DESC LIMIT $limit OFFSET $offset";
+            cmd.Parameters.AddWithValue("$limit", limit); cmd.Parameters.AddWithValue("$offset", offset);
             using var reader = cmd.ExecuteReader(); var rows = new List<RunRow>();
-            while (reader.Read()) rows.Add(new(reader.GetString(0), reader.GetString(1), reader.IsDBNull(2) ? null : reader.GetString(2), reader.GetString(3), reader.GetString(4), reader.GetString(5), reader.GetString(6), reader.GetString(7)));
+            while (reader.Read()) rows.Add(new(reader.GetString(0), reader.GetString(1), reader.IsDBNull(2) ? null : reader.GetString(2), reader.GetString(8), reader.GetString(3), reader.GetString(4), reader.GetString(5), reader.GetString(6), reader.GetString(7)));
             return rows;
         }
     }
@@ -67,12 +83,13 @@ public sealed class Store : IDisposable
             return new(runId, sequence, type, timestamp, element);
         }
     }
-    public List<StoredEvent> Events(string runId, long after = 0)
+    public List<StoredEvent> Events(string runId, long after = 0, int limit = 1000)
     {
         lock (gate)
         {
-            using var cmd = connection.CreateCommand(); cmd.CommandText = "SELECT sequence,type,timestamp,payload FROM events WHERE runId=$id AND sequence>$after ORDER BY sequence LIMIT 1000";
-            cmd.Parameters.AddWithValue("$id", runId); cmd.Parameters.AddWithValue("$after", after);
+            limit = Math.Clamp(limit, 1, 5000);
+            using var cmd = connection.CreateCommand(); cmd.CommandText = "SELECT sequence,type,timestamp,payload FROM events WHERE runId=$id AND sequence>$after ORDER BY sequence LIMIT $limit";
+            cmd.Parameters.AddWithValue("$id", runId); cmd.Parameters.AddWithValue("$after", after); cmd.Parameters.AddWithValue("$limit", limit);
             using var reader = cmd.ExecuteReader(); var events = new List<StoredEvent>();
             while (reader.Read()) events.Add(new(runId, reader.GetInt64(0), reader.GetString(1), reader.GetString(2), JsonSerializer.Deserialize<JsonElement>(reader.GetString(3))));
             return events;
@@ -81,5 +98,5 @@ public sealed class Store : IDisposable
     public void Dispose() => connection.Dispose();
 }
 
-public sealed record RunRow(string Id, string TaskId, string? ParentId, string Workspace, string Prompt, string Provider, string Status, string Created);
+public sealed record RunRow(string Id, string TaskId, string? ParentId, string Kind, string Workspace, string Prompt, string Provider, string Status, string Created);
 public sealed record StoredEvent(string RunId, long Sequence, string Type, string Timestamp, JsonElement Payload);

@@ -8,7 +8,8 @@
     "build": "tsc --noEmit && vite build",
     "start": "electron .",
     "dev": "vite --host 127.0.0.1",
-    "test:desktop": "node scripts/smoke.cjs"
+    "test:desktop": "node scripts/smoke.cjs",
+    "test:conversation": "node scripts/conversation.cjs"
   },
   "dependencies": {
     "@monaco-editor/react": "4.7.0",

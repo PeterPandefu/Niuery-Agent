@@ -9,7 +9,7 @@ try
 {
     var providers = await ProviderConfiguration.LoadAsync(args[0]);
     using var store = new Store(args[1]);
-    await using var host = new WorkerHost(store, providers);
+    await using var host = new WorkerHost(store, providers, args[0]);
     while (await Console.In.ReadLineAsync() is { } line)
     {
         string? requestId = null;

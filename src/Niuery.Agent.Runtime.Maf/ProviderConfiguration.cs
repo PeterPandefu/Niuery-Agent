@@ -7,14 +7,22 @@ public sealed record ProviderConfiguration(
     string Kind,
     string BaseUrl,
     string Model,
-    string? ApiKeyEnvironmentVariable,
+    string? ApiKey,
     bool SupportsTools = true,
     bool SupportsStreaming = true,
-    int TimeoutSeconds = 60)
+    int TimeoutSeconds = 60,
+    IReadOnlyList<string>? Models = null,
+    bool Enabled = true)
 {
-    public Uri Validate()
+    public IReadOnlyList<string> AvailableModels => (Models ?? Array.Empty<string>())
+        .Concat(string.IsNullOrWhiteSpace(Model) ? Array.Empty<string>() : new[] { Model })
+        .Where(model => !string.IsNullOrWhiteSpace(model))
+        .Distinct(StringComparer.Ordinal)
+        .ToArray();
+
+    public Uri Validate(bool requireModel = true)
     {
-        if (string.IsNullOrWhiteSpace(Id) || string.IsNullOrWhiteSpace(Model) || Model.Contains("请填写"))
+        if (string.IsNullOrWhiteSpace(Id) || (requireModel && (string.IsNullOrWhiteSpace(Model) || Model.Contains("请填写"))))
             throw new ConfigurationException("请填写提供商编号和实际模型名。");
         if (Kind is not ("openai-compatible" or "ollama"))
             throw new ConfigurationException("提供商类型必须为 openai-compatible 或 ollama。");
@@ -29,24 +37,17 @@ public sealed record ProviderConfiguration(
             throw new ConfigurationException("此验收要求模型同时支持工具调用和流式输出。");
         if (TimeoutSeconds is < 1 or > 600)
             throw new ConfigurationException("请求时限必须在 1 到 600 秒之间。");
-        if (Kind == "openai-compatible" && string.IsNullOrWhiteSpace(ApiKeyEnvironmentVariable))
-            throw new ConfigurationException("OpenAI 兼容服务需要配置密钥环境变量名。");
+        if (Kind == "openai-compatible" && string.IsNullOrWhiteSpace(ApiKey))
+            throw new ConfigurationException("OpenAI 兼容服务需要配置 API Key。");
         return uri;
     }
 
-    public string ResolveApiKey()
+    public string ResolveApiKey(bool requireModel = true)
     {
-        Validate();
-        if (Kind == "ollama" && string.IsNullOrWhiteSpace(ApiKeyEnvironmentVariable))
+        Validate(requireModel);
+        if (Kind == "ollama" && string.IsNullOrWhiteSpace(ApiKey))
             return "ollama";
-        var value = Environment.GetEnvironmentVariable(ApiKeyEnvironmentVariable!);
-        if (string.IsNullOrWhiteSpace(value) && OperatingSystem.IsWindows())
-            value = Environment.GetEnvironmentVariable(ApiKeyEnvironmentVariable!, EnvironmentVariableTarget.User);
-        if (string.IsNullOrWhiteSpace(value) && OperatingSystem.IsWindows())
-            value = Environment.GetEnvironmentVariable(ApiKeyEnvironmentVariable!, EnvironmentVariableTarget.Machine);
-        if (string.IsNullOrWhiteSpace(value))
-            throw new ConfigurationException("未找到配置所引用的密钥环境变量，请在本机设置后重新启动进程。");
-        return value;
+        return ApiKey!;
     }
 
     public static async Task<IReadOnlyList<ProviderConfiguration>> LoadAsync(string path, CancellationToken cancellationToken = default)

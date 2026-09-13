@@ -1,6 +1,6 @@
 import fs from 'node:fs'; import path from 'node:path'; import os from 'node:os'; import assert from 'node:assert/strict'; import { WorkerClient, root } from './worker-client.mjs';
 const directory=fs.mkdtempSync(path.join(os.tmpdir(),'niuery-stage3-'));fs.writeFileSync(path.join(directory,'failing.csproj'),'<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>');fs.writeFileSync(path.join(directory,'Calculator.cs'), 'public static class Calculator { public static int Add(int a,int b) => a - b; }');
-const database=path.join(directory,'tasks.db');const worker=new WorkerClient(database);const approvals=[];worker.observers.push(e=>{if(e.type==='approval.requested')approvals.push(e);});
+fs.mkdirSync(path.join(directory,'.git'));const database=path.join(directory,'tasks.db');const worker=new WorkerClient(database);const approvals=[];worker.observers.push(e=>{if(e.type==='approval.requested')approvals.push(e);});
 try {
  const run=await worker.request('run.start',{workspace:directory,providerId:'routin',prompt:'这是自动化验收，禁止提问和只写计划，必须立即执行工具：第一步必须调用 ReadFile(path="Calculator.cs", startLine=1, lineCount=50)；第二步必须调用 ApplyPatch(path="Calculator.cs", expectedHash=上一步返回的hash, oldText="a - b", newText="a + b")。ApplyPatch 必须等待用户审批，收到批准后才写文件。完成后停止，不运行命令。'});
  let resolved=false;const deadline=Date.now()+240000;

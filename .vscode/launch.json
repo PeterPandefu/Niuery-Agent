@@ -1,0 +1,53 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "调试 Worker",
+      "type": "coreclr",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/Niuery.Agent.Worker/bin/Debug/net10.0/Niuery.Agent.Worker.dll",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "${workspaceFolder}/config/providers.local.json",
+        "${workspaceFolder}/artifacts/agent.db"
+      ],
+      "stopAtEntry": false,
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "preLaunchTask": "构建 Worker"
+    },
+    {
+      "name": "调试 Diagnostics 探针",
+      "type": "coreclr",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/Niuery.Agent.Diagnostics/bin/Debug/net10.0/Niuery.Agent.Diagnostics.dll",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "probe",
+        "${workspaceFolder}/config/providers.local.json",
+        "compatible"
+      ],
+      "stopAtEntry": false,
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "preLaunchTask": "构建 Diagnostics"
+    },
+    {
+      "name": "调试桌面前端",
+      "type": "node",
+      "request": "launch",
+      "cwd": "${workspaceFolder}/apps/desktop",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["start"],
+      "console": "integratedTerminal",
+      "preLaunchTask": "构建桌面前端"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "前后端联调",
+      "configurations": ["调试桌面前端", "调试 Worker"],
+      "stopAll": true
+    }
+  ]
+}

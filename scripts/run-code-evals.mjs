@@ -1,4 +1,5 @@
 import fs from 'node:fs'; import path from 'node:path'; import os from 'node:os'; import { WorkerClient, root } from './worker-client.mjs';
+const createTempDirectory = fs.mkdtempSync.bind(fs); fs.mkdtempSync = (...args) => { const directory = createTempDirectory(...args); fs.mkdirSync(path.join(directory, '.git')); return directory; };
 const tasks=[
  {id:'add',file:'Calculator.cs',before:'public static int Add(int a,int b) => a - b;',after:'public static int Add(int a,int b) => a + b;',prompt:'读取 Calculator.cs，把 Add 方法从减法修复为加法。必须读取后使用 ApplyPatch，等待审批后写入文件。不要提问。'},
  {id:'multiply',file:'Calculator.cs',before:'public static int Multiply(int a,int b) => a + b;',after:'public static int Multiply(int a,int b) => a * b;',prompt:'读取 Calculator.cs，把 Multiply 方法修复为乘法。必须读取后使用 ApplyPatch，等待审批后写入文件。不要提问。'},

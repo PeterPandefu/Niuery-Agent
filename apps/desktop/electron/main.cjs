@@ -41,7 +41,7 @@ app.whenReady().then(() => {
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   window.webContents.on('will-navigate', e => e.preventDefault());
   ipcMain.handle('worker:request', async (event, method, payload) => {
-    if (event.sender !== window.webContents || !['hello','providers.list','history.list','events.list','run.start','run.cancel','approval.respond','workspace.diff','workspace.read','workspace.apply','workspace.command','run.continue','artifact.undo'].includes(method)) throw new Error('请求不被允许。');
+    if (event.sender !== window.webContents || !['hello','project.open','providers.list','providers.save','providers.test','providers.sync','history.list','events.list','run.start','chat.start','task.delete','run.cancel','approval.respond','workspace.diff','workspace.read','workspace.apply','workspace.command','run.continue','artifact.undo'].includes(method)) throw new Error('请求不被允许。');
     if (JSON.stringify(payload).length > 1000000) throw new Error('请求过大。');
     return request(method, payload);
   });
