@@ -26,7 +26,7 @@ const { chromium, expect } = require('playwright/test');
           if (method === 'workspace.diff') return [];
           if (method === 'events.list') return [
             { runId: payload.runId, sequence: 1, type: 'run.started', timestamp: runs.find(run => run.id === payload.runId).created, payload: { message: '执行已开始。' } },
-            { runId: payload.runId, sequence: 2, type: 'message.delta', timestamp: runs.find(run => run.id === payload.runId).created, payload: { text: Array.from({ length: 12 }, (_, line) => `第 ${line + 1} 行回复：这是一段用于验证历史滚动、问答定位与输入区位置的内容。`).join('\n') } },
+            { runId: payload.runId, sequence: 2, type: 'message.delta', timestamp: runs.find(run => run.id === payload.runId).created, payload: { text: payload.runId === 'chat-0' ? '代码示例：\n\n```javascript\nconst answer = 42;\nconsole.log(answer);\n```' : Array.from({ length: 12 }, (_, line) => `第 ${line + 1} 行回复：这是一段用于验证历史滚动、问答定位与输入区位置的内容。`).join('\n') } },
             { runId: payload.runId, sequence: 3, type: 'run.completed', timestamp: runs.find(run => run.id === payload.runId).created, payload: { message: '执行完成。' } },
           ];
           if (method === 'run.continue') {
@@ -48,6 +48,7 @@ const { chromium, expect } = require('playwright/test');
     await page.goto(server.resolvedUrls.local[0]);
     await page.getByRole('navigation', { name: 'Chat 任务列表' }).getByRole('button').first().click();
     await expect(page.locator('.answer')).toHaveCount(12);
+    await expect(page.locator('.answer pre code')).toHaveText('const answer = 42;\nconsole.log(answer);');
     await expect(page.locator('.conversation-turn')).toHaveCount(12);
     await expect(page.locator('.turn-timeline .timeline-item')).toHaveCount(0);
     await expect(page.locator('.timeline-latest')).toHaveCount(12);

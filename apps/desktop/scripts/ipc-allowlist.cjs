@@ -51,10 +51,10 @@ Module._load = function (request, parent, isMain) {
       app,
       BrowserWindow,
       ipcMain: { handle: (name, handler) => handlers.set(name, handler) },
-      dialog: { showOpenDialog: async () => ({ canceled: true, filePaths: [] }) },
+      dialog: { showOpenDialog: async () => ({ canceled: true, filePaths: [] }), showMessageBoxSync: () => 0 },
     };
   }
-  if (request === 'node:child_process') return { spawn: () => worker };
+  if (request === 'node:child_process') return { spawn: () => worker, spawnSync: () => ({ status: 0, error: null }) };
   if (request === 'node:readline') return { createInterface: () => ({ on: (_, callback) => { lineHandler = callback; } }) };
   return originalLoad.call(this, request, parent, isMain);
 };

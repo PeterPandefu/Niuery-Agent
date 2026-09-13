@@ -12,7 +12,9 @@ public sealed record ProviderConfiguration(
     bool SupportsStreaming = true,
     int TimeoutSeconds = 60,
     IReadOnlyList<string>? Models = null,
-    bool Enabled = true)
+    bool Enabled = true,
+    string Transport = "chat-completions",
+    string ReasoningOutput = "none")
 {
     public IReadOnlyList<string> AvailableModels => (Models ?? Array.Empty<string>())
         .Concat(string.IsNullOrWhiteSpace(Model) ? Array.Empty<string>() : new[] { Model })
@@ -26,6 +28,10 @@ public sealed record ProviderConfiguration(
             throw new ConfigurationException("请填写提供商编号和实际模型名。");
         if (Kind is not ("openai-compatible" or "ollama"))
             throw new ConfigurationException("提供商类型必须为 openai-compatible 或 ollama。");
+        if (Transport is not ("chat-completions" or "responses"))
+            throw new ConfigurationException("模型传输协议必须为 chat-completions 或 responses。");
+        if (ReasoningOutput is not ("none" or "summary" or "full"))
+            throw new ConfigurationException("思考输出必须为 none、summary 或 full。");
         if (!Uri.TryCreate(BaseUrl, UriKind.Absolute, out var uri) ||
             !string.IsNullOrEmpty(uri.UserInfo) || !string.IsNullOrEmpty(uri.Query) ||
             !string.IsNullOrEmpty(uri.Fragment) ||

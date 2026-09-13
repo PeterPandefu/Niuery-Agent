@@ -7,9 +7,24 @@ using Microsoft.Extensions.AI;
 
 namespace Niuery.Agent.Worker;
 
-public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration> initialProviders, string configPath) : IAsyncDisposable
+public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration> initialProviders, string configPath, Func<ProviderConfiguration, IChatClient>? clientFactory = null) : IAsyncDisposable
 {
+    /// <summary>
+    /// Chat 模式默认使用的临时工作区。目录位于当前用户桌面，不依赖前端传入路径。
+    /// </summary>
+    public static string DefaultChatWorkspace
+    {
+        get
+        {
+            var desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+            if (string.IsNullOrWhiteSpace(desktop))
+                desktop = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Desktop");
+            return Path.Combine(desktop, "NiueryWorkSpace");
+        }
+    }
+
     private IReadOnlyList<ProviderConfiguration> providers = initialProviders;
+    private readonly Func<ProviderConfiguration, IChatClient> clientFactory = clientFactory ?? HarnessFactory.CreateClient;
     private readonly ConcurrentDictionary<string, (CancellationTokenSource Cancellation, Task Work)> active = new();
     private ApprovalGate? approvalGate;
     private ApprovalGate Approvals => approvalGate ??= new ApprovalGate((id, type, body) => Emit(id, type, body));
@@ -17,9 +32,9 @@ public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration>
     {
         object result = method switch
         {
-            "hello" => new { version = 1, name = "Niuery Agent", capabilities = new[] { "streaming", "cancel", "history", "project.open", "chat.start", "mode.get", "mode.set", "workspace.diff" } },
+            "hello" => new { version = 1, name = "Niuery Agent", capabilities = new[] { "streaming", "cancel", "history", "project.open", "chat.start", "mode.get", "mode.set", "workspace.diff", "workspace.gitDiff", "workspace.tree", "workspace.read", "workspace.apply", "workspace.command", "artifact.undo" } },
             "project.open" => await OpenProject(payload),
-            "providers.list" => providers.Select(p => new { p.Id, p.Kind, p.BaseUrl, p.Model, Models = p.AvailableModels, p.ApiKey, p.SupportsTools, p.SupportsStreaming, p.TimeoutSeconds, p.Enabled }).ToArray(),
+            "providers.list" => providers.Select(p => new { p.Id, p.Kind, p.BaseUrl, p.Model, Models = p.AvailableModels, p.ApiKey, p.SupportsTools, p.SupportsStreaming, p.TimeoutSeconds, p.Enabled, p.Transport, p.ReasoningOutput }).ToArray(),
             "providers.save" => await SaveProviders(payload),
             "providers.test" => await TestProvider(payload),
             "providers.sync" => await SyncProvider(payload),
@@ -34,6 +49,8 @@ public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration>
             "run.cancel" => Cancel(payload.Required("runId")),
             "approval.respond" => Approvals.Respond(payload.Required("runId"), payload.Required("approvalId"), payload.Required("digest"), payload.GetProperty("approved").GetBoolean()),
             "workspace.diff" => GetWorkspaceDiff(payload),
+            "workspace.gitDiff" => await GetGitDiff(payload),
+            "workspace.tree" => GetWorkspaceTree(payload),
             "workspace.read" => await ReadWorkspace(payload),
             "workspace.apply" => BeginApply(payload),
             "workspace.command" => BeginCommand(payload),
@@ -177,7 +194,7 @@ public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration>
     {
         if (!store.History(1000).Any(run => run.TaskId == taskId))
             throw new InvalidOperationException("找不到指定任务。");
-        return new { taskId, mode = store.LoadTaskState(taskId)?.Mode ?? "plan" };
+        return new { taskId, mode = store.LoadTaskState(taskId)?.Mode ?? "execute" };
     }
 
     private object SetMode(string taskId, string mode)
@@ -188,7 +205,7 @@ public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration>
         if (taskRuns.Any(run => active.ContainsKey(run.Id)))
             throw new InvalidOperationException("任务执行中不能切换模式，请等待任务完成。");
         var current = store.LoadTaskState(taskId);
-        var previous = current?.Mode ?? "plan";
+        var previous = current?.Mode ?? "execute";
         if (previous == mode) return new { taskId, mode };
         store.SaveTaskState(taskId, mode, current?.SessionJson);
         var run = taskRuns.OrderByDescending(item => item.Created).First();
@@ -237,6 +254,44 @@ public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration>
         }
         return result;
     }
+    private static object GetWorkspaceTree(JsonElement payload)
+    {
+        var root = Path.GetFullPath(payload.Required("workspace"));
+        if (!Directory.Exists(root)) throw new InvalidOperationException("工作区目录不存在。");
+        var tools = new WorkspaceTools(root, (_, _, _) => Task.CompletedTask, (_, _) => { }, CancellationToken.None);
+        var files = tools.WorkspaceFiles().Take(5000).ToArray();
+        return new { root, files };
+    }
+    private static async Task<object> GetGitDiff(JsonElement payload)
+    {
+        var root = Path.GetFullPath(payload.Required("workspace"));
+        if (!Directory.Exists(root)) throw new InvalidOperationException("工作区目录不存在。");
+        var statusResult = await WorkspaceTools.Execute("git", ["--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=all"], root, CancellationToken.None);
+        if (statusResult.ExitCode != 0) throw new InvalidOperationException("当前目录不是可用的 Git 工作区。");
+        var prefixResult = await WorkspaceTools.Execute("git", ["rev-parse", "--show-prefix"], root, CancellationToken.None);
+        var repoPrefix = prefixResult.ExitCode == 0 ? prefixResult.Output.Trim().Replace('\\', '/') : "";
+        var branchResult = await WorkspaceTools.Execute("git", ["branch", "--show-current"], root, CancellationToken.None);
+        var files = new List<object>();
+        foreach (var raw in statusResult.Output.Replace("\r", "").Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (raw.Length < 4) continue;
+            var code = raw[..2];
+            var repoPath = raw[3..].Trim();
+            if (repoPath.Contains(" -> ", StringComparison.Ordinal)) repoPath = repoPath[(repoPath.LastIndexOf(" -> ", StringComparison.Ordinal) + 4)..];
+            var path = repoPrefix.Length > 0 && repoPath.StartsWith(repoPrefix, StringComparison.Ordinal) ? repoPath[repoPrefix.Length..] : repoPath;
+            var full = Path.Combine(root, path);
+            var after = File.Exists(full) ? await File.ReadAllTextAsync(full) : "";
+            var beforeResult = await WorkspaceTools.Execute("git", ["show", $"HEAD:{repoPath}"], root, CancellationToken.None);
+            var before = beforeResult.ExitCode == 0 ? beforeResult.Output : "";
+            var diffResult = await WorkspaceTools.Execute("git", ["--no-pager", "diff", "HEAD", "--numstat", "--", path], root, CancellationToken.None);
+            var nums = diffResult.Output.Replace("\r", "").Split('\n').Select(line => line.Split('\t')).FirstOrDefault(parts => parts.Length >= 2 && int.TryParse(parts[0], out _) && int.TryParse(parts[1], out _));
+            var additions = nums is not null && int.TryParse(nums[0], out var a) ? a : (before.Length == 0 ? CountLines(after) : 0);
+            var deletions = nums is not null && int.TryParse(nums[1], out var d) ? d : 0;
+            files.Add(new { path, status = code.Trim(), before, after, additions, deletions });
+        }
+        return new { branch = branchResult.Output.Trim(), files, totalAdditions = files.Sum(x => (int)x.GetType().GetProperty("additions")!.GetValue(x)!), totalDeletions = files.Sum(x => (int)x.GetType().GetProperty("deletions")!.GetValue(x)!) };
+    }
+    private static int CountLines(string text) => string.IsNullOrEmpty(text) ? 0 : text.Replace("\r\n", "\n").Split('\n').Length - (text.EndsWith('\n') ? 1 : 0);
     private object Start(JsonElement payload)
     {
         return Start(payload, null, payload.Required("workspace"), payload.Required("providerId"), "project");
@@ -245,7 +300,11 @@ public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration>
     private object Start(JsonElement payload, string? parentId, string workspaceValue, string providerId, string kind, string? taskId = null)
     {
         if (!active.IsEmpty) throw new InvalidOperationException("首版本地执行器一次只运行一个任务，请等待或取消当前执行。");
-        var workspace = string.IsNullOrWhiteSpace(workspaceValue) ? "" : Path.GetFullPath(workspaceValue);
+        var workspace = string.IsNullOrWhiteSpace(workspaceValue)
+            ? (kind == "chat" ? DefaultChatWorkspace : "")
+            : Path.GetFullPath(workspaceValue);
+        if (kind == "chat" && string.IsNullOrWhiteSpace(workspaceValue))
+            Directory.CreateDirectory(workspace);
         if ((kind == "project" || workspace.Length > 0) && !Directory.Exists(workspace)) throw new InvalidOperationException("工作区目录不存在。");
         var provider = providers.SingleOrDefault(p => p.Id == providerId) ?? throw new InvalidOperationException("提供商不存在。");
         if (!provider.Enabled) throw new InvalidOperationException("该模型服务已停用，请选择启用的模型服务。");
@@ -258,6 +317,7 @@ public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration>
         provider.Validate(); provider.ResolveApiKey();
         var prompt = payload.Required("prompt");
         if (prompt.Length > 32000) throw new InvalidOperationException("任务说明过长，请控制在 32000 字符内。");
+        if (kind == "project") EnsureGitBaseline(workspace);
         var mode = ResolveMode(payload, taskId);
         var row = store.Create(kind, workspace, prompt, provider.Id, parentId);
         var previousState = store.LoadTaskState(row.TaskId);
@@ -271,11 +331,32 @@ public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration>
         return row;
     }
 
+    private static void EnsureGitBaseline(string workspace)
+    {
+        var gitPath = Path.Combine(workspace, ".git");
+        if (Directory.Exists(gitPath) || File.Exists(gitPath)) return;
+        if (Directory.EnumerateFileSystemEntries(workspace).Any()) return;
+
+        RunGit(workspace, ["init"]);
+        // 使用仓库级身份，避免要求用户先配置全局 Git 身份。
+        RunGit(workspace, ["-c", "user.name=Niuery Agent", "-c", "user.email=agent@localhost", "add", "--all"]);
+        RunGit(workspace, ["-c", "user.name=Niuery Agent", "-c", "user.email=agent@localhost", "commit", "--allow-empty", "-m", "初始化项目基线"]);
+    }
+
+    private static void RunGit(string workspace, string[] arguments)
+    {
+        var info = new System.Diagnostics.ProcessStartInfo("git") { WorkingDirectory = workspace, RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+        foreach (var argument in arguments) info.ArgumentList.Add(argument);
+        using var process = System.Diagnostics.Process.Start(info) ?? throw new InvalidOperationException("无法启动 Git，请安装 Git 后重试。");
+        process.WaitForExit();
+        if (process.ExitCode != 0) throw new InvalidOperationException($"Git 初始化失败：{process.StandardError.ReadToEnd().Trim()}");
+    }
+
     private string ResolveMode(JsonElement payload, string? taskId)
     {
         if (payload.TryGetProperty("mode", out var modeValue) && modeValue.ValueKind == JsonValueKind.String)
             return ValidateMode(modeValue.GetString());
-        return taskId is null ? "plan" : ValidateMode(store.LoadTaskState(taskId)?.Mode ?? "plan");
+        return taskId is null ? "execute" : ValidateMode(store.LoadTaskState(taskId)?.Mode ?? "execute");
     }
 
     private static string ValidateMode(string? mode)
@@ -299,12 +380,12 @@ public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration>
         try
         {
             Emit(row.Id, "run.started", new { message = "执行已开始。", provider.Model, processId = Environment.ProcessId, startedAt = DateTimeOffset.UtcNow });
-            using var client = HarnessFactory.CreateClient(provider);
+            using var client = clientFactory(provider);
             var tools = string.IsNullOrWhiteSpace(row.Workspace) ? null : new WorkspaceTools(row.Workspace, (name, arguments, ct) => Approvals.Require(row.Id, name, arguments, ct),
                 (type, body) => Emit(row.Id, type, body), token);
             var taskState = store.LoadTaskState(row.TaskId);
-            var mode = ValidateMode(taskState?.Mode ?? "plan");
-            agent = row.Kind == "chat" ? HarnessFactory.CreateChat(client, tools?.Functions() ?? [], tools is not null, mode) : HarnessFactory.CreateCoding(client, tools!.Functions(), mode);
+            var mode = ValidateMode(taskState?.Mode ?? "execute");
+            agent = row.Kind == "chat" ? HarnessFactory.CreateChat(client, tools?.Functions() ?? [], tools is not null, mode, provider.ReasoningOutput) : HarnessFactory.CreateCoding(client, tools!.Functions(), mode, provider.ReasoningOutput);
             if (!string.IsNullOrWhiteSpace(taskState?.SessionJson))
             {
                 try
@@ -323,6 +404,8 @@ public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration>
             var modeProvider = agent.GetService<AgentModeProvider>();
             if (modeProvider is not null) await modeProvider.SetModeAsync(session, mode, token);
             var pending = new StringBuilder();
+            var reasoningPending = new StringBuilder();
+            var hasReasoning = false;
             var messages = new List<ChatMessage>();
             if (!restored && row.Kind == "chat")
             {
@@ -336,9 +419,25 @@ public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration>
             messages.Add(new ChatMessage(ChatRole.User, row.Prompt));
             await foreach (var update in agent.RunStreamingAsync(messages, session, cancellationToken: token))
             {
-                token.ThrowIfCancellationRequested(); pending.Append(update.Text);
+                token.ThrowIfCancellationRequested();
+                pending.Append(update.Text);
+                foreach (var reasoning in update.Contents.OfType<TextReasoningContent>())
+                {
+                    if (!string.IsNullOrEmpty(reasoning.Text))
+                    {
+                        hasReasoning = true;
+                        reasoningPending.Append(reasoning.Text);
+                    }
+                }
+                if (reasoningPending.Length >= 80)
+                {
+                    Emit(row.Id, "reasoning.delta", new { text = reasoningPending.ToString(), format = provider.ReasoningOutput });
+                    reasoningPending.Clear();
+                }
                 if (pending.Length >= 80) { Emit(row.Id, "message.delta", new { text = pending.ToString() }); pending.Clear(); }
             }
+            if (reasoningPending.Length > 0) Emit(row.Id, "reasoning.delta", new { text = reasoningPending.ToString(), format = provider.ReasoningOutput });
+            if (hasReasoning) Emit(row.Id, "reasoning.completed", new { format = provider.ReasoningOutput });
             if (pending.Length > 0) Emit(row.Id, "message.delta", new { text = pending.ToString() });
             token.ThrowIfCancellationRequested();
         }
@@ -351,7 +450,7 @@ public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration>
                 try
                 {
                     var modeProvider = agent.GetService<AgentModeProvider>();
-                    var mode = modeProvider is null ? (store.LoadTaskState(row.TaskId)?.Mode ?? "plan") : await modeProvider.GetModeAsync(session, CancellationToken.None);
+                    var mode = modeProvider is null ? (store.LoadTaskState(row.TaskId)?.Mode ?? "execute") : await modeProvider.GetModeAsync(session, CancellationToken.None);
                     var snapshot = await agent.SerializeSessionAsync(session, cancellationToken: CancellationToken.None);
                     store.SaveTaskState(row.TaskId, ValidateMode(mode), snapshot.GetRawText());
                 }

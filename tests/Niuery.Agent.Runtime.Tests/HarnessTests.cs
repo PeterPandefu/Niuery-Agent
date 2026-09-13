@@ -8,8 +8,8 @@ namespace Niuery.Agent.Runtime.Tests;
 
 public sealed class HarnessTests
 {
-    [Fact(DisplayName = "编码 Harness 默认使用计划模式并支持切换")]
-    public async Task CodingHarnessUsesPlanModeByDefault()
+    [Fact(DisplayName = "编码 Harness 默认使用执行模式并支持切换")]
+    public async Task CodingHarnessUsesExecuteModeByDefault()
     {
         using var client = new ScriptedChatClient();
         var agent = HarnessFactory.CreateCoding(client, []);
@@ -17,9 +17,9 @@ public sealed class HarnessTests
         var provider = agent.GetService<AgentModeProvider>();
 
         Assert.NotNull(provider);
-        Assert.Equal("plan", await provider!.GetModeAsync(session));
-        await provider.SetModeAsync(session, "execute");
-        Assert.Equal("execute", await provider.GetModeAsync(session));
+        Assert.Equal("execute", await provider!.GetModeAsync(session));
+        await provider.SetModeAsync(session, "plan");
+        Assert.Equal("plan", await provider.GetModeAsync(session));
     }
 
     [Fact(DisplayName = "MAF 流式循环执行真实本地函数并将结果传回模型接口")]
@@ -36,6 +36,20 @@ public sealed class HarnessTests
         Assert.Equal(2, client.RequestCount);
         Assert.Contains("本地工具证据", output.ToString());
         Assert.Contains(client.LastMessages.SelectMany(m => m.Contents), c => c is FunctionResultContent);
+    }
+
+    [Fact(DisplayName = "Harness 保留模型返回的思考摘要且配置 reasoning 输出")]
+    public async Task StreamingPreservesReasoningContent()
+    {
+        using var client = new ScriptedChatClient { IncludeReasoning = true };
+        var agent = HarnessFactory.CreateProbe(client, [], reasoningOutput: "summary");
+        var session = await agent.CreateSessionAsync();
+        var updates = new List<AgentResponseUpdate>();
+        await foreach (var update in agent.RunStreamingAsync("总结。", session)) updates.Add(update);
+
+        Assert.Equal(ReasoningOutput.Summary, client.LastOptions?.Reasoning?.Output);
+        Assert.Contains(updates.SelectMany(update => update.Contents), content =>
+            content is TextReasoningContent reasoning && reasoning.Text.Contains("验证工具"));
     }
 
     [Fact(DisplayName = "会话序列化恢复保留历史且不重新执行已有工具")]

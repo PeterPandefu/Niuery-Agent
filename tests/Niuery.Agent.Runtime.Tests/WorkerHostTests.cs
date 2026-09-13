@@ -10,6 +10,20 @@ public sealed class WorkerHostTests
     private static ProviderConfiguration Provider => new(
         "test", "ollama", "http://127.0.0.1:11434/v1/", "model", null);
 
+    [Fact(DisplayName = "握手能力声明包含工作区命令执行")]
+    public async Task HelloAdvertisesWorkspaceCommandCapability()
+    {
+        var directory = Directory.CreateTempSubdirectory("niuery-hello-").FullName;
+        var config = Path.Combine(directory, "providers.json");
+        await File.WriteAllTextAsync(config, "{}");
+        await using var host = new WorkerHost(new Store(Path.Combine(directory, "tasks.db")), [Provider], config);
+
+        var response = JsonSerializer.SerializeToElement(await host.Handle("hello", default));
+        var capabilities = response.GetProperty("capabilities").EnumerateArray().Select(item => item.GetString());
+
+        Assert.Contains("workspace.command", capabilities);
+    }
+
     [Fact(DisplayName = "项目打开接受 Git 和非 Git 目录并标记仓库状态")]
     public async Task ProjectOpenAcceptsAnyWorkspace()
     {
@@ -65,5 +79,26 @@ public sealed class WorkerHostTests
         Assert.Contains("execute", changed.ToString());
         Assert.Equal("execute", store.LoadTaskState(run.TaskId)?.Mode);
         Assert.Contains(store.Events(run.Id), item => item.Type == "mode.changed" && item.Payload.GetProperty("source").GetString() == "user");
+    }
+
+    [Fact(DisplayName = "Worker 持久化 reasoning 增量并与最终回答分离")]
+    public async Task WorkerPersistsReasoningEventsSeparately()
+    {
+        var directory = Directory.CreateTempSubdirectory("niuery-reasoning-").FullName;
+        var config = Path.Combine(directory, "providers.json");
+        await File.WriteAllTextAsync(config, "{}");
+        using var store = new Store(Path.Combine(directory, "tasks.db"));
+        using var client = new ScriptedChatClient { IncludeReasoning = true, TextOnly = true };
+        await using var host = new WorkerHost(store, [Provider with { ReasoningOutput = "summary" }], config, _ => client);
+
+        var run = (RunRow)await host.Handle("chat.start", JsonSerializer.SerializeToElement(new { providerId = Provider.Id, prompt = "总结请求。", workspace = directory }));
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (store.History().Single(item => item.Id == run.Id).Status == "running" && DateTime.UtcNow < deadline)
+            await Task.Delay(20);
+
+        var events = store.Events(run.Id);
+        Assert.Contains(events, item => item.Type == "reasoning.delta" && item.Payload.GetProperty("text").GetString()!.Contains("分析请求"));
+        Assert.Contains(events, item => item.Type == "reasoning.completed");
+        Assert.Equal("脚本模型最终回答。", string.Concat(events.Where(item => item.Type == "message.delta").Select(item => item.Payload.GetProperty("text").GetString())));
     }
 }

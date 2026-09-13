@@ -45,6 +45,7 @@ public sealed class WorkspaceTools(string root, Func<string, object, Cancellatio
             else yield return Path.GetRelativePath(workspace, entry);
         }
     }
+    public IEnumerable<string> WorkspaceFiles() => Enumerate(workspace);
     private async Task<T> Tool<T>(string name, object arguments, Func<Task<T>> action)
     {
         runToken.ThrowIfCancellationRequested(); var toolCallId = Guid.NewGuid().ToString("N");
@@ -115,8 +116,48 @@ public sealed class WorkspaceTools(string root, Func<string, object, Cancellatio
     {
         if (string.IsNullOrWhiteSpace(executable) || executable.Length > 1024 || arguments.Sum(a => a.Length) > 16000) throw new InvalidOperationException("命令参数不合法。");
         await approve("运行命令", new { executable, arguments, workspace, warning = "此命令使用你的本机权限，可访问工作区外部资源。" }, runToken);
-        return await Execute(executable, arguments, workspace, runToken);
+        // 命令可能直接创建或修改文件（例如 dotnet new console），不会经过 ApplyPatch。
+        // 在命令前后记录文本文件快照，统一生成差异制品，确保非 Git 工作区也能显示和撤销成果。
+        var before = CaptureTextFiles();
+        try { return await Execute(executable, arguments, workspace, runToken); }
+        finally { EmitFileChanges(before); }
     });
+
+    private Dictionary<string, string> CaptureTextFiles()
+    {
+        var snapshot = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var relative in Enumerate(workspace).Take(1000))
+        {
+            try
+            {
+                var full = Resolve(relative);
+                if (new FileInfo(full).Length > 256000) continue;
+                var text = File.ReadAllText(full);
+                if (!text.Contains('\0')) snapshot[relative] = text;
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+        return snapshot;
+    }
+
+    private void EmitFileChanges(IReadOnlyDictionary<string, string> before)
+    {
+        var after = CaptureTextFiles();
+        foreach (var path in before.Keys.Union(after.Keys, StringComparer.OrdinalIgnoreCase).OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
+        {
+            var existed = before.TryGetValue(path, out var beforeText);
+            var exists = after.TryGetValue(path, out var afterText);
+            if (existed == exists && string.Equals(beforeText, afterText, StringComparison.Ordinal)) continue;
+            var afterValue = afterText ?? "";
+            emit("artifact.created", new
+            {
+                artifactId = Guid.NewGuid().ToString("N"), workspace, path,
+                before = beforeText ?? "", after = afterValue, existed,
+                hash = Hash(afterValue), message = $"命令修改文件：{path}"
+            });
+        }
+    }
     [Description("只读查询 Git 状态与差异；不提交或推送。")]
     public Task<object> GitStatus() => Tool<object>("GitStatus", new { }, async () => new
     {

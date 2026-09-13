@@ -7,7 +7,7 @@
   "properties": {
     "version": { "const": 1 },
     "requestId": { "type": "string", "minLength": 1 },
-    "method": { "enum": ["hello", "project.open", "providers.list", "providers.save", "providers.test", "providers.sync", "history.list", "events.list", "run.start", "chat.start", "task.delete", "run.cancel", "run.continue", "approval.respond", "workspace.diff", "workspace.read", "workspace.apply", "workspace.command", "artifact.undo", "worktree.create", "worktree.remove", "worker.shutdown"] },
+    "method": { "enum": ["hello", "project.open", "providers.list", "providers.save", "providers.test", "providers.sync", "history.list", "events.list", "run.start", "chat.start", "task.delete", "run.cancel", "run.continue", "mode.get", "mode.set", "approval.respond", "workspace.diff", "workspace.gitDiff", "workspace.tree", "workspace.read", "workspace.apply", "workspace.command", "artifact.undo", "worktree.create", "worktree.remove", "worker.shutdown"] },
     "payload": { "type": "object" }
   }
 }

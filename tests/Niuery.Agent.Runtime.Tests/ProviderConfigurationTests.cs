@@ -36,4 +36,12 @@ public sealed class ProviderConfigurationTests
 
     [Fact(DisplayName = "不支持工具调用的模型不能通过编码验收")]
     public void RejectMissingTools() => Assert.Throws<ConfigurationException>(() => (Valid with { SupportsTools = false }).Validate());
+
+    [Fact(DisplayName = "Responses 传输协议可以创建 MAF ChatClient")]
+    public void ResponsesTransportCreatesChatClient()
+    {
+        var config = Valid with { Transport = "responses", ReasoningOutput = "summary" };
+        using var client = HarnessFactory.CreateClient(config);
+        Assert.NotNull(client);
+    }
 }

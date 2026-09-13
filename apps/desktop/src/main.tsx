@@ -3,6 +3,9 @@ import { createRoot } from "react-dom/client";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import mermaid from "mermaid";
+import { diffLines } from "diff";
+import { Terminal } from "@xterm/xterm";
+import "@xterm/xterm/css/xterm.css";
 import {
   Activity,
   AlertTriangle,
@@ -19,7 +22,9 @@ import {
   FolderOpen,
   GitBranch,
   History,
+  ListChecks,
   Menu,
+  MoreVertical,
   MessageCircle,
   PanelRight,
   Plus,
@@ -32,6 +37,14 @@ import {
   X,
   XCircle,
   Zap,
+  Search,
+  Globe,
+  RefreshCw,
+  ArrowLeft,
+  ArrowRight,
+  ExternalLink,
+  Folder,
+  FileText,
 } from "lucide-react";
 import "./style.css";
 import type { Method } from "./protocol.generated";
@@ -68,6 +81,8 @@ type Provider = {
   supportsStreaming?: boolean;
   timeoutSeconds?: number;
   enabled?: boolean;
+  transport?: "chat-completions" | "responses";
+  reasoningOutput?: "none" | "summary" | "full";
 };
 type Artifact = {
   artifactId: string;
@@ -88,6 +103,12 @@ type Approval = {
   arguments?: any;
   message?: string;
 };
+type DiffLine = {
+  kind: "context" | "added" | "removed";
+  oldNumber: number | null;
+  newNumber: number | null;
+  text: string;
+};
 declare global {
   interface Window {
     agent: {
@@ -95,6 +116,12 @@ declare global {
       chooseWorkspace: () => Promise<string | null>;
       onEvent: (cb: (e: Event) => void) => () => void;
       onStatus: (cb: (s: string) => void) => () => void;
+      openInExplorer: (path: string) => Promise<void>;
+      startTerminal: (cwd: string) => Promise<{ id: string }>;
+      writeTerminal: (id: string, data: string) => void;
+      closeTerminal: (id: string) => void;
+      onTerminalData: (cb: (data: { id: string; data: string }) => void) => () => void;
+      onTerminalExit: (cb: (data: { id: string; data: string }) => void) => () => void;
     };
   }
 }
@@ -126,19 +153,31 @@ const eventText: Record<string, string> = {
   "session.restored": "已恢复任务会话",
   "session.restore.failed": "任务会话恢复失败，已创建新会话",
   "session.save.failed": "任务状态保存失败",
+  "reasoning.completed": "思考摘要已完成",
 };
 
 function timelineEventsForRun(events: Event[], runId: string) {
   return events.filter((event) =>
     event.runId === runId &&
     event.type !== "message.delta" &&
+    event.type !== "reasoning.delta" &&
     event.type !== "approval.requested" &&
     event.type !== "approval.resolved",
   );
 }
 
 function timelineEventLabel(event: Event) {
-  return event.payload.message || eventText[event.type] || event.type;
+  const message = event.payload.message || eventText[event.type] || event.type;
+  if ((event.type === "tool.started" || event.type === "tool.completed") && event.payload.name) {
+    const argumentsValue = event.payload.arguments;
+    if (argumentsValue && typeof argumentsValue === "object" && Object.keys(argumentsValue).length > 0) {
+      const details = Object.entries(argumentsValue as Record<string, unknown>)
+        .map(([key, value]) => `${key}=${typeof value === "string" ? value : JSON.stringify(value)}`)
+        .join(", ");
+      return `${message}（${details}）`;
+    }
+  }
+  return message;
 }
 
 function eventOutput(event: Event) {
@@ -157,11 +196,44 @@ function eventOutput(event: Event) {
   return null;
 }
 
+function splitDiffLines(value: string) {
+  const lines = value.replace(/\r\n/g, "\n").split("\n");
+  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+  return lines;
+}
+
+function buildDiffLines(before: string, after: string) {
+  const lines: DiffLine[] = [];
+  let oldNumber = 1;
+  let newNumber = 1;
+  for (const change of diffLines(before, after)) {
+    for (const text of splitDiffLines(change.value)) {
+      if (change.added) {
+        lines.push({ kind: "added", oldNumber: null, newNumber, text });
+        newNumber += 1;
+      } else if (change.removed) {
+        lines.push({ kind: "removed", oldNumber, newNumber: null, text });
+        oldNumber += 1;
+      } else {
+        lines.push({ kind: "context", oldNumber, newNumber, text });
+        oldNumber += 1;
+        newNumber += 1;
+      }
+    }
+  }
+  return {
+    lines,
+    added: lines.filter((line) => line.kind === "added").length,
+    removed: lines.filter((line) => line.kind === "removed").length,
+  };
+}
+
 const thinkingPhrases = [
   "脑瓜飞转",
   "火花四溅",
   "哒哒狂奔",
-  "CPU烧了、小跑带风",
+  "CPU烧了",
+  "小跑带风",
   "开足马力",
   "火箭发射",
   "眼冒金星",
@@ -275,6 +347,90 @@ function MarkdownAnswer({ content }: { content: string }) {
   );
 }
 
+type WorkspaceMode = "landing" | "review" | "terminal" | "browser" | "files";
+type TreeNode = { name: string; path: string; directory: boolean; children: TreeNode[] };
+type GitFile = { path: string; status: string; additions: number; deletions: number; before: string; after: string };
+
+function makeTree(files: string[]): TreeNode[] {
+  const root: TreeNode[] = [];
+  for (const path of files) {
+    let cursor = root;
+    const parts = path.split(/[\\/]/).filter(Boolean);
+    let built = "";
+    parts.forEach((name, index) => {
+      built = built ? `${built}/${name}` : name;
+      let node = cursor.find((item) => item.name === name);
+      if (!node) { node = { name, path: built, directory: index < parts.length - 1, children: [] }; cursor.push(node); }
+      cursor = node.children;
+    });
+  }
+  const sort = (nodes: TreeNode[]) => { nodes.sort((a, b) => Number(b.directory) - Number(a.directory) || a.name.localeCompare(b.name, "zh-CN")); nodes.forEach((n) => sort(n.children)); };
+  sort(root); return root;
+}
+
+function languageFor(path: string) {
+  const ext = path.split(".").pop()?.toLowerCase();
+  const map: Record<string, string> = { ts: "typescript", tsx: "typescript", js: "javascript", cjs: "javascript", json: "json", cs: "csharp", css: "css", html: "html", md: "markdown", ps1: "powershell", xml: "xml", yaml: "yaml", yml: "yaml", sql: "sql", sh: "shell" };
+  return map[ext || ""] || "plaintext";
+}
+function isMarkdownFile(path: string) { return /\.(md|markdown|mdown)$/i.test(path); }
+
+function WorkspacePanel({ mode, setMode, workspace, onClose }: { mode: WorkspaceMode; setMode: (mode: WorkspaceMode) => void; workspace: string; onClose: () => void }) {
+  const [review, setReview] = useState<{ branch: string; files: GitFile[]; totalAdditions: number; totalDeletions: number } | null>(null);
+  const [reviewFile, setReviewFile] = useState<GitFile | null>(null);
+  const [tree, setTree] = useState<TreeNode[]>([]);
+  const [expandedTree, setExpandedTree] = useState<Record<string, boolean>>({});
+  const [filter, setFilter] = useState("");
+  const [selectedFile, setSelectedFile] = useState("");
+  const [fileText, setFileText] = useState("");
+  const [fileError, setFileError] = useState("");
+  const [browserUrl, setBrowserUrl] = useState("");
+  const [browserInput, setBrowserInput] = useState("");
+  const terminalRef = useRef<HTMLDivElement | null>(null);
+  const terminalInstance = useRef<Terminal | null>(null);
+  const terminalId = useRef<string | null>(null);
+
+  const refreshReview = () => workspace && window.agent.request("workspace.gitDiff", { workspace }).then(setReview).then(() => setReviewFile(null)).catch((e: Error) => setFileError(e.message));
+  useEffect(() => { if (mode === "review") void refreshReview(); }, [mode, workspace]);
+  useEffect(() => {
+    if (mode !== "files" || !workspace) return;
+    window.agent.request("workspace.tree", { workspace }).then((result: { files: string[] }) => setTree(makeTree(result.files))).catch((e: Error) => setFileError(e.message));
+  }, [mode, workspace]);
+  useEffect(() => {
+    if (mode !== "files" || !selectedFile || !workspace) return;
+    setFileError("");
+    window.agent.request("workspace.read", { workspace, path: selectedFile, startLine: 1, lineCount: 400 }).then((result: { text: string }) => setFileText(result.text)).catch((e: Error) => setFileError(e.message));
+  }, [mode, selectedFile, workspace]);
+  useEffect(() => {
+    if (mode !== "terminal" || !workspace || !terminalRef.current) return;
+    const terminal = new Terminal({ convertEol: true, cursorBlink: true, fontSize: 12, fontFamily: "'DM Mono', Consolas, monospace", theme: { background: "#10151d", foreground: "#d9e2ef", cursor: "#8fb3ff" } });
+    terminal.open(terminalRef.current); terminal.focus(); terminalInstance.current = terminal;
+    let alive = true;
+    window.agent.startTerminal(workspace).then(({ id }) => { if (!alive) return window.agent.closeTerminal(id); terminalId.current = id; terminal.onData((data) => window.agent.writeTerminal(id, data)); });
+    const offData = window.agent.onTerminalData(({ id, data }) => { if (id === terminalId.current) terminal.write(data); });
+    const offExit = window.agent.onTerminalExit(({ id }) => { if (id === terminalId.current) terminal.write("\\r\\n[终端已退出]\\r\\n"); });
+    return () => { alive = false; if (terminalId.current) window.agent.closeTerminal(terminalId.current); terminalId.current = null; offData(); offExit(); terminal.dispose(); terminalInstance.current = null; };
+  }, [mode, workspace]);
+
+  const openBrowser = () => { const value = browserInput.trim(); if (!value) return; const target = /^https?:\/\//i.test(value) ? value : `https://www.google.com/search?q=${encodeURIComponent(value)}`; setBrowserUrl(target); };
+  const filteredTree = (nodes: TreeNode[]): TreeNode[] => nodes.flatMap((node) => {
+    const children = node.directory ? filteredTree(node.children) : [];
+    if (!filter || node.name.toLowerCase().includes(filter.toLowerCase()) || children.length) return [{ ...node, children }];
+    return [];
+  });
+  const renderTree = (nodes: TreeNode[], depth = 0): React.ReactNode => nodes.map((node) => <React.Fragment key={node.path}><button className={`tree-row ${selectedFile === node.path ? "selected" : ""}`} style={{ paddingLeft: 12 + depth * 15 }} onClick={() => node.directory ? setExpandedTree((old) => ({ ...old, [node.path]: !old[node.path] })) : setSelectedFile(node.path)}>{node.directory ? (expandedTree[node.path] ? <ChevronDown size={14} /> : <ChevronRight size={14} />) : <span className="tree-spacer" />}{node.directory ? <Folder size={14} /> : <FileText size={14} />}<span>{node.name}</span></button>{node.directory && expandedTree[node.path] && renderTree(node.children, depth + 1)}</React.Fragment>);
+
+  const navItems: Array<[WorkspaceMode, React.ReactNode, string, string]> = [["review", <FileDiff size={16} />, "审查", "Ctrl+Shift+G"], ["terminal", <SquareTerminal size={16} />, "终端", "Ctrl+`"], ["browser", <Globe size={16} />, "浏览器", "Ctrl+T"], ["files", <FolderOpen size={16} />, "文件", "Ctrl+P"]];
+  if (mode === "landing") return <div className="workspace-landing"><div className="workspace-landing-actions"><button onClick={onClose} aria-label="关闭工作区"><ChevronRight size={17} /></button></div><div className="workspace-menu">{navItems.map(([key, icon, label, shortcut]) => <button key={key} onClick={() => setMode(key)}><span className="workspace-menu-icon">{icon}</span><span>{label}</span><kbd>{shortcut}</kbd></button>)}</div></div>;
+  return <div className={`workspace-panel workspace-${mode}`}>
+    <header className="workspace-header"><div className="workspace-tabs">{navItems.map(([key, icon, label]) => <button key={key} className={mode === key ? "active" : ""} onClick={() => setMode(key)}>{icon}{label}</button>)}</div><button className="workspace-close" onClick={onClose} aria-label="关闭工作区"><ChevronRight size={17} /></button></header>
+    {mode === "review" && <div className="review-workspace"><div className="review-main"><div className="workspace-toolbar"><div><strong>审查</strong><span>{review?.branch || "当前工作区"}</span></div><button onClick={() => void refreshReview()}><RefreshCw size={14} /> 刷新</button></div><div className="review-stats"><b>+{review?.totalAdditions || 0}</b><b>−{review?.totalDeletions || 0}</b><span>{review?.files.length || 0} 个文件</span></div>{reviewFile ? <div className="review-diff"><div className="review-file-title"><FileText size={14} /> {reviewFile.path}</div><div className="diff-preview review-diff-preview">{buildDiffLines(reviewFile.before, reviewFile.after).lines.map((line, index) => <div className={`diff-line ${line.kind}`} key={`${index}-${line.text}`}><span className="diff-gutter">{line.kind === "removed" ? line.oldNumber : ""}</span><span className="diff-gutter">{line.kind === "added" ? line.newNumber : line.kind === "context" ? line.newNumber : ""}</span><span className="diff-marker">{line.kind === "removed" ? "−" : line.kind === "added" ? "+" : " "}</span><code>{line.text || " "}</code></div>)}</div></div> : <div className="workspace-empty"><GitBranch size={28} /><strong>{review ? (review.files.length ? "选择文件查看差异" : "工作区干净") : "正在读取 Git 差异…"}</strong></div>}</div><aside className="review-files"><div className="section-caption">变更文件</div>{review?.files.map((file) => <button className={`review-file-row ${reviewFile?.path === file.path ? "selected" : ""}`} key={file.path} onClick={() => setReviewFile(file)}><span className={`git-status status-${file.status[0] || "M"}`}>{file.status[0] || "M"}</span><span>{file.path}</span><em>+{file.additions} −{file.deletions}</em></button>)}</aside></div>}
+    {mode === "terminal" && <div className="terminal-shell"><div ref={terminalRef} className="terminal-host" /></div>}
+    {mode === "browser" && <div className="browser-shell"><div className="browser-toolbar"><button onClick={() => (document.querySelector(".embedded-browser") as any)?.goBack()}><ArrowLeft size={15} /></button><button onClick={() => (document.querySelector(".embedded-browser") as any)?.goForward()}><ArrowRight size={15} /></button><button onClick={() => (document.querySelector(".embedded-browser") as any)?.reload()}><RefreshCw size={15} /></button><form onSubmit={(e) => { e.preventDefault(); openBrowser(); }}><Globe size={14} /><input value={browserInput} onChange={(e) => setBrowserInput(e.target.value)} placeholder="搜索或输入网址" /></form><button onClick={() => browserUrl && window.agent.openInExplorer(browserUrl)} title="在系统浏览器打开"><ExternalLink size={15} /></button></div>{browserUrl ? React.createElement("webview", { className: "embedded-browser", src: browserUrl, allowpopups: true }) : <div className="workspace-empty"><Globe size={32} /><strong>开始浏览</strong><span>输入 URL 以打开页面</span></div>}</div>}
+    {mode === "files" && <div className="files-workspace"><div className="file-editor"><div className="file-editor-head"><div><strong>{selectedFile ? selectedFile.split(/[\\/]/).pop() : "未选择文件"}</strong><span>{selectedFile || "从右侧文件树选择文件"}</span></div>{selectedFile && <button onClick={() => void window.agent.openInExplorer(`${workspace}/${selectedFile}`)}><ExternalLink size={14} /> 打开</button>}</div>{fileError ? <div className="workspace-error">{fileError}</div> : selectedFile ? (isMarkdownFile(selectedFile) ? <div className="file-markdown answer"><MarkdownAnswer content={fileText} /></div> : <pre className="file-code">{fileText.split("\n").map((line, index) => <span className="file-code-line" key={index}><i>{index + 1}</i><code>{line || " "}</code></span>)}</pre>) : <div className="workspace-empty"><FileText size={28} /><strong>选择一个文件</strong></div>}</div><aside className="file-tree"><div className="file-tree-search"><Search size={14} /><input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="筛选文件…" /></div><div className="tree-list">{renderTree(filteredTree(tree))}</div></aside></div>}
+  </div>;
+}
+
 function App() {
   const [runs, setRuns] = useState<Run[]>([]),
     [providers, setProviders] = useState<Provider[]>([]),
@@ -293,17 +449,19 @@ function App() {
   });
   const [activeProjectId, setActiveProjectId] = useState(() => localStorage.getItem("activeProjectId") || "");
   const [composeKind, setComposeKind] = useState<"project" | "chat">("project");
-  const [workMode, setWorkMode] = useState<AgentMode>("plan");
+  const [workMode, setWorkMode] = useState<AgentMode>("execute");
   const [contextMenu, setContextMenu] = useState<{ taskId: string; x: number; y: number } | null>(null);
   const [projectToRemove, setProjectToRemove] = useState<Project | null>(null);
+  const [projectMenu, setProjectMenu] = useState<{ id: string; x: number; y: number } | null>(null);
   const [keyframeHoverIndex, setKeyframeHoverIndex] = useState<number | null>(null);
   const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
   const conversationRef = useRef<HTMLElement | null>(null);
   const stickConversationToBottom = useRef(false);
   const [settings, setSettings] = useState(false),
     [rightOpen, setRightOpen] = useState(true),
-    [rightTab, setRightTab] = useState<"diff" | "activity">("diff"),
-    [expanded, setExpanded] = useState<Record<string, boolean>>({}),
+    [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("landing"),
+     [expanded, setExpanded] = useState<Record<string, boolean>>({}),
+     [reasoningExpanded, setReasoningExpanded] = useState<Record<string, boolean>>({}),
     [timelineExpanded, setTimelineExpanded] = useState<Record<string, boolean>>({}),
     [customProviders, setCustomProviders] = useState<Provider[]>([]),
     [settingsProviderId, setSettingsProviderId] = useState(""),
@@ -317,7 +475,28 @@ function App() {
     [providerToRemove, setProviderToRemove] = useState<Provider | null>(null),
     [testingProviderId, setTestingProviderId] = useState<string | null>(null),
     [connectionResult, setConnectionResult] = useState<{ providerId: string; ok: boolean; message: string } | null>(null);
+  const [leftOpen, setLeftOpen] = useState(true), [leftWidth, setLeftWidth] = useState(252), [rightWidth, setRightWidth] = useState(340);
+  const dragRef = useRef<{ side: "left" | "right"; start: number; width: number } | null>(null);
+  function beginDrag(side: "left" | "right", event: React.PointerEvent) { dragRef.current = { side, start: event.clientX, width: side === "left" ? leftWidth : rightWidth }; event.currentTarget.setPointerCapture(event.pointerId); }
+  function dragPanel(event: React.PointerEvent) { const d = dragRef.current; if (!d) return; const delta = event.clientX - d.start; if (d.side === "left") setLeftWidth(Math.min(420, Math.max(180, d.width + delta))); else setRightWidth(Math.min(900, Math.max(360, d.width - delta))); }
+  function endDrag() { dragRef.current = null; }
+  function resizeByKeyboard(side: "left" | "right", key: string) {
+    const step = key === "ArrowLeft" ? -16 : key === "ArrowRight" ? 16 : 0;
+    if (!step) return;
+    if (side === "left") setLeftWidth((value) => Math.min(420, Math.max(180, value + step)));
+    else setRightWidth((value) => Math.min(900, Math.max(360, value - step)));
+  }
   const allProviders = [...providers, ...customProviders];
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      if (!event.ctrlKey || event.altKey || event.metaKey) return;
+      if (event.shiftKey && event.key.toLowerCase() === "g") { event.preventDefault(); setRightOpen(true); setWorkspaceMode("review"); }
+      else if (!event.shiftKey && event.key === "`") { event.preventDefault(); setRightOpen(true); setWorkspaceMode("terminal"); }
+      else if (!event.shiftKey && event.key.toLowerCase() === "t") { event.preventDefault(); setRightOpen(true); setWorkspaceMode("browser"); }
+      else if (!event.shiftKey && event.key.toLowerCase() === "p") { event.preventDefault(); setRightOpen(true); setWorkspaceMode("files"); }
+    };
+    window.addEventListener("keydown", handler); return () => window.removeEventListener("keydown", handler);
+  }, []);
   useEffect(() => { localStorage.setItem("projects", JSON.stringify(projects)); }, [projects]);
   useEffect(() => { localStorage.setItem("activeProjectId", activeProjectId); }, [activeProjectId]);
   useEffect(() => {
@@ -392,7 +571,7 @@ function App() {
       workspace.split(/[\\/]/).filter(Boolean).pop() || "未选择项目";
   useEffect(() => {
     if (!current) {
-      setWorkMode("plan");
+      setWorkMode("execute");
       return;
     }
     window.agent.request("mode.get", { taskId: current.taskId })
@@ -416,6 +595,7 @@ function App() {
     return runs.filter((run) => run.taskId === current.taskId).sort((a, b) => new Date(a.created).getTime() - new Date(b.created).getTime()).map((run) => ({
       run,
       output: events.filter((event) => event.runId === run.id && event.type === "message.delta").map((event) => event.payload.text || "").join(""),
+      reasoning: events.filter((event) => event.runId === run.id && event.type === "reasoning.delta").map((event) => event.payload.text || "").join(""),
     }));
   }, [current, runs, events]);
   useEffect(() => {
@@ -491,24 +671,10 @@ function App() {
   }
   function newProjectTask(project: Project) {
     setWorkspace(project.path); localStorage.setItem("workspace", project.path);
-    setActiveProjectId(project.id); setComposeKind("project"); setSelected(null); setPrompt(""); setWorkMode("plan");
+    setActiveProjectId(project.id); setComposeKind("project"); setSelected(null); setPrompt(""); setWorkMode("execute");
   }
   function newChatTask() {
-    setComposeKind("chat"); setSelected(null); setPrompt(""); setWorkspace(""); setWorkMode("plan");
-  }
-  function selectComposeKind(kind: "project" | "chat") {
-    if (kind === composeKind) return;
-    setComposeKind(kind);
-    setSelected(null);
-    if (kind === "chat") {
-      setWorkspace("");
-      return;
-    }
-    const activeProject = projects.find((project) => project.id === activeProjectId);
-    if (activeProject) {
-      setWorkspace(activeProject.path);
-      localStorage.setItem("workspace", activeProject.path);
-    }
+    setComposeKind("chat"); setSelected(null); setPrompt(""); setWorkspace(""); setWorkMode("execute");
   }
   function removeProject(project: Project) {
     setProjects((old) => old.filter((p) => p.id !== project.id));
@@ -737,13 +903,14 @@ function App() {
   }
 
   return (
-    <div className="app-shell" onClick={() => setContextMenu(null)}>
-      <aside className="sidebar">
+    <div className="app-shell" style={{ gridTemplateColumns: `${leftOpen ? leftWidth : 0}px minmax(420px, 1fr) ${rightOpen ? rightWidth : 0}px` }} onClick={() => { setContextMenu(null); setProjectMenu(null); }}>
+      <aside className={`sidebar ${leftOpen ? "" : "collapsed"}`}>
         <div className="brand">
           <span className="brand-mark">N</span>
           <span>
             Niuery <em>Agent</em>
           </span>
+          <button className="collapse-panel left-collapse" onClick={() => setLeftOpen(false)} aria-label="收起项目栏"><ChevronRight size={16} /></button>
         </div>
         <div className="side-heading"><span>项目</span><button aria-label="添加项目" onClick={chooseWorkspace}><Plus size={15} /></button></div>
         <nav className="project-list" aria-label="项目列表">
@@ -753,7 +920,7 @@ function App() {
               <div className="project-row">
                 <button className="project-name" onClick={() => newProjectTask(project)}><FolderOpen size={14} /><span>{project.name}</span></button>
                 <button className="project-add" aria-label={`为${project.name}新建任务`} onClick={() => newProjectTask(project)}><Plus size={14} /></button>
-                <button className="project-remove" aria-label={`移除项目${project.name}`} onClick={() => setProjectToRemove(project)}><X size={13} /></button>
+                <button className="project-remove" aria-label={`项目${project.name}更多操作`} aria-expanded={projectMenu?.id === project.id} onClick={(event) => { event.stopPropagation(); const rect = event.currentTarget.getBoundingClientRect(); setProjectMenu(projectMenu?.id === project.id ? null : { id: project.id, x: Math.max(8, rect.right - 164), y: rect.bottom + 4 }); }}><MoreVertical size={16} aria-hidden="true" /></button>
               </div>
               {items.map((run) => <button key={run.taskId} className={`task-row nested ${run.id === selected ? "selected" : ""}`} onClick={() => { setSelected(run.id); setComposeKind("project"); setWorkspace(project.path); setActiveProjectId(project.id); }} onContextMenu={(event) => openTaskMenu(event, run)}>
                 <span className={`status-mark ${run.status}`}>{statusIcon[run.status]}</span><span className="task-copy"><strong>{run.taskTitle || run.prompt}</strong><small>{statusText[run.status]} · {new Date(run.created).toLocaleDateString("zh-CN")}</small></span>
@@ -777,9 +944,13 @@ function App() {
           </span>
         </div>
       </aside>
+      {projectMenu && (() => { const project = projects.find(item => item.id === projectMenu.id); if (!project) return null; return <div className="project-context-menu" role="menu" style={{ left: projectMenu.x, top: projectMenu.y }} onClick={e => e.stopPropagation()}><button role="menuitem" onClick={() => { setProjectToRemove(project); setProjectMenu(null); }}>删除项目</button><button role="menuitem" onClick={() => { window.agent.openInExplorer(project.path); setProjectMenu(null); }}>在资源浏览器打开</button></div>; })()}
+      <div className="panel-splitter left-splitter" style={{ left: leftOpen ? leftWidth - 3 : 0 }} onPointerDown={(e) => beginDrag("left", e)} onPointerMove={dragPanel} onPointerUp={endDrag} onKeyDown={(e) => { if (e.key === "ArrowLeft" || e.key === "ArrowRight") { e.preventDefault(); resizeByKeyboard("left", e.key); } }} tabIndex={leftOpen ? 0 : -1} role="separator" aria-orientation="vertical" aria-valuemin={180} aria-valuemax={420} aria-valuenow={leftWidth} aria-label="调整左侧栏宽度" />
       {contextMenu && <div className="task-context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} onClick={(event) => event.stopPropagation()}><button onClick={deleteTask}><X size={14} /> 删除任务</button></div>}
       {projectToRemove && <div className="settings-overlay project-confirm-overlay" role="presentation" onClick={() => setProjectToRemove(null)}><div className="project-confirm" role="dialog" aria-modal="true" aria-labelledby="project-confirm-title" onClick={(event) => event.stopPropagation()}><div className="project-confirm-icon"><AlertTriangle size={20} /></div><div><h2 id="project-confirm-title">移除项目？</h2><p>将从项目列表移除“{projectToRemove.name}”。历史任务不会被删除，重新添加同一路径后可以恢复关联。</p></div><div className="project-confirm-actions"><button className="cancel-button" onClick={() => setProjectToRemove(null)}>取消</button><button className="danger-button" onClick={() => removeProject(projectToRemove)}>确认移除</button></div></div></div>}
       <main className="main-pane">
+        {!leftOpen && <button className="reopen-left collapse-panel" onClick={() => setLeftOpen(true)} aria-label="展开项目栏"><ChevronRight size={16} /></button>}
+        {!rightOpen && <button className="reopen-right collapse-panel" onClick={() => setRightOpen(true)} aria-label="展开成果栏"><ChevronRight size={16} /></button>}
         <header className="topbar">
           <div className="topbar-title">
             <span className="breadcrumb">
@@ -865,7 +1036,7 @@ function App() {
                 <span>一起把它完成。</span>
               </h2>
               <p>
-                {composeKind === "chat" ? "这是一个独立的 Chat 对话。" : "选择一个项目，描述你想实现的结果。Agent 会先了解代码，再在需要时请求你的决定。"}
+                {composeKind === "chat" ? "这是一个独立的 Chat 对话，默认使用桌面上的 NiueryWorkSpace 临时工作区。" : "选择一个项目，描述你想实现的结果。Agent 会先了解代码，再在需要时请求你的决定。"}
               </p>
               <div className="starter-grid">
                 {[
@@ -899,10 +1070,10 @@ function App() {
                   className="review-toggle"
                   onClick={() => setRightOpen((value) => !value)}
                 >
-                  <PanelRight size={14} /> {rightOpen ? "收起成果" : "查看成果"}
+                  <PanelRight size={14} /> {rightOpen ? "收起工作区" : "打开工作区"}
                 </button>
               </div>
-              {conversationTurns.map(({ run, output: turnOutput }, index) => {
+              {conversationTurns.map(({ run, output: turnOutput, reasoning: turnReasoning }, index) => {
                 const timelineEvents = timelineEventsForRun(events, run.id);
                 const latestTimelineAction = timelineEvents.length > 0
                   ? timelineEventLabel(timelineEvents[timelineEvents.length - 1])
@@ -911,17 +1082,27 @@ function App() {
                 return (
                 <div className="conversation-turn" id={`turn-${run.id}`} key={run.id}>
                   <div className="user-prompt">
-                    <span className="prompt-label">你的问题</span>
                     <p>{run.prompt}</p>
                   </div>
-                  {turnOutput ? (
+                  {turnOutput || turnReasoning ? (
                     <div className="agent-message">
                       <div className="message-avatar">N</div>
                       <div>
                         <span className="message-label">Agent</span>
-                        <div className="answer">
-                          <MarkdownAnswer content={turnOutput} />
-                        </div>
+                        {turnReasoning && (
+                          <details
+                            className="reasoning-block"
+                            open={reasoningExpanded[run.id] ?? run.status === "running"}
+                            onToggle={(event) => setReasoningExpanded((current) => ({
+                              ...current,
+                              [run.id]: (event.currentTarget as HTMLDetailsElement).open,
+                            }))}
+                          >
+                            <summary>思考摘要</summary>
+                            <div className="reasoning-content">{turnReasoning}</div>
+                          </details>
+                        )}
+                        {turnOutput && <div className="answer"><MarkdownAnswer content={turnOutput} /></div>}
                       </div>
                     </div>
                   ) : index === conversationTurns.length - 1 && run.status === "running" ? (
@@ -1040,31 +1221,6 @@ function App() {
               }}
             />
               <div className="composer-toolbar">
-                <label className="mode-select">
-                <SlidersHorizontal size={14} />
-                <select
-                  aria-label="工作模式"
-                  title="选择 MAF 工作模式"
-                  value={composeKind}
-                  onChange={(e) => selectComposeKind(e.target.value as "project" | "chat")}
-                >
-                  <option value="project">编码模式</option>
-                  <option value="chat">Chat 模式</option>
-                </select>
-                </label>
-                <label className="mode-select">
-                  <SlidersHorizontal size={14} />
-                  <select
-                    aria-label="Agent 模式"
-                    title="选择 Agent 计划或执行模式"
-                    value={workMode}
-                    disabled={running || busy}
-                    onChange={(e) => void setTaskMode(e.target.value as AgentMode)}
-                  >
-                    <option value="plan">计划模式</option>
-                    <option value="execute">执行模式</option>
-                  </select>
-                </label>
               <label className="model-select">
                 <Settings2 size={14} />
                 <select
@@ -1077,15 +1233,16 @@ function App() {
                   )))}
                 </select>
               </label>
-              <span className="composer-hint">
-                {composeKind === "chat"
-                  ? "Chat 对话 · Enter 发送，Shift + Enter 换行"
-                  : !workspace
-                  ? "先选择一个项目"
-                  : current && !canContinue
-                    ? "只有已完成或中断的任务可以继续"
-                    : "Enter 发送，Shift + Enter 换行"}
-              </span>
+              <button
+                className={`plan-mode-button ${workMode === "plan" ? "active" : ""}`}
+                type="button"
+                aria-pressed={workMode === "plan"}
+                disabled={running || busy}
+                title={workMode === "plan" ? "切换到执行模式" : "启用计划模式"}
+                onClick={() => void setTaskMode(workMode === "plan" ? "execute" : "plan")}
+              >
+                <ListChecks size={14} /> 计划模式
+              </button>
               {current && workMode === "plan" && canContinue && !running && (
                 <button
                   className="approve-button"
@@ -1125,114 +1282,8 @@ function App() {
           </div>
         </footer>
       </main>
-      {rightOpen && (
-        <aside className="result-pane">
-          <div className="result-tabs">
-            <button
-              className={rightTab === "diff" ? "active" : ""}
-              onClick={() => setRightTab("diff")}
-            >
-              <FileDiff size={15} /> 成果{" "}
-              {artifacts.length > 0 && <b>{artifacts.length}</b>}
-            </button>
-            <button
-              className={rightTab === "activity" ? "active" : ""}
-              onClick={() => setRightTab("activity")}
-            >
-              <Activity size={15} /> 活动
-            </button>
-            <button
-              className="close-result"
-              onClick={() => setRightOpen(false)}
-              aria-label="收起成果"
-            >
-              <ChevronRight size={16} />
-            </button>
-          </div>
-          {rightTab === "diff" ? (
-            <div className="result-content">
-              {!current || artifacts.length === 0 ? (
-                <div className="result-empty">
-                  <FileCode2 size={25} />
-                  <strong>这里会显示文件成果</strong>
-                  <span>Agent 修改文件后，你可以在这里检查、撤销。</span>
-                </div>
-              ) : (
-                artifacts.map((artifact) => (
-                  <div className="file-result" key={artifact.artifactId}>
-                    <button
-                      className="file-result-head"
-                      onClick={() =>
-                        setExpanded({
-                          ...expanded,
-                          [artifact.artifactId]: !expanded[artifact.artifactId],
-                        })
-                      }
-                    >
-                      <span>
-                        <FileCode2 size={14} /> {artifact.path}
-                      </span>
-                      {expanded[artifact.artifactId] ? (
-                        <ChevronDown size={14} />
-                      ) : (
-                        <ChevronRight size={14} />
-                      )}
-                    </button>
-                    {expanded[artifact.artifactId] && (
-                      <>
-                        <div className="diff-summary">
-                          <span className="added">
-                            +{" "}
-                            {Math.max(
-                              1,
-                              artifact.after.split("\n").length -
-                                artifact.before.split("\n").length,
-                            )}{" "}
-                            行
-                          </span>
-                          <span>
-                            {artifact.message || "文件已修改"}
-                            {artifact.changedSinceArtifact && "（文件之后又发生了变化）"}
-                          </span>
-                        </div>
-                        <pre className="diff-preview">
-                          <code>{artifact.current ?? artifact.after}</code>
-                        </pre>
-                        <button
-                          className="undo-button"
-                          onClick={() => undo(artifact)}
-                        >
-                          <RotateCcw size={13} /> 撤销这次修改
-                        </button>
-                      </>
-                    )}
-                  </div>
-                ))
-              )}
-            </div>
-          ) : (
-            <div className="activity-list">
-              {events.map((event) => (
-                <div key={`${event.runId}-${event.sequence}`} className="activity-row">
-                  <time>
-                    {new Date(event.timestamp).toLocaleTimeString("zh-CN")}
-                  </time>
-                  <span>
-                    {event.payload.message || eventText[event.type] || event.type}
-                    {eventOutput(event) && (
-                      <pre className="activity-output">{eventOutput(event)}</pre>
-                    )}
-                  </span>
-                </div>
-              ))}
-            </div>
-          )}
-          <div className="workspace-foot">
-            <span>工作区</span>
-            <code>{current?.workspace || workspace || "尚未选择项目"}</code>
-          </div>
-        </aside>
-      )}
+      <div className="panel-splitter right-splitter" style={{ right: rightOpen ? rightWidth - 3 : 0 }} onPointerDown={(e) => beginDrag("right", e)} onPointerMove={dragPanel} onPointerUp={endDrag} onKeyDown={(e) => { if (e.key === "ArrowLeft" || e.key === "ArrowRight") { e.preventDefault(); resizeByKeyboard("right", e.key); } }} tabIndex={rightOpen ? 0 : -1} role="separator" aria-orientation="vertical" aria-valuemin={360} aria-valuemax={900} aria-valuenow={rightWidth} aria-label="调整右侧工作区宽度" />
+      {rightOpen && <aside className="result-pane workspace-pane"><WorkspacePanel mode={workspaceMode} setMode={setWorkspaceMode} workspace={current?.workspace || workspace} onClose={() => setRightOpen(false)} /></aside>}
       {settings && (
         <div className="settings-overlay" onClick={() => { setSyncOpen(false); setSettings(false); }}>
           <section
@@ -1353,6 +1404,27 @@ function App() {
                           updateProvider(selectedSettingsProvider.id, { baseUrl: e.target.value })
                         }
                       />
+                    </label>
+                    <label>
+                      协议
+                      <select
+                        value={selectedSettingsProvider.transport || "chat-completions"}
+                        onChange={(e) => updateProvider(selectedSettingsProvider.id, { transport: e.target.value as Provider["transport"] })}
+                      >
+                        <option value="chat-completions">Chat Completions</option>
+                        <option value="responses">Responses（支持思考摘要）</option>
+                      </select>
+                    </label>
+                    <label>
+                      思考输出
+                      <select
+                        value={selectedSettingsProvider.reasoningOutput || "none"}
+                        onChange={(e) => updateProvider(selectedSettingsProvider.id, { reasoningOutput: e.target.value as Provider["reasoningOutput"] })}
+                      >
+                        <option value="none">不记录</option>
+                        <option value="summary">记录摘要</option>
+                        <option value="full">记录完整内容（谨慎使用）</option>
+                      </select>
                     </label>
                     <label>
                       API Key
