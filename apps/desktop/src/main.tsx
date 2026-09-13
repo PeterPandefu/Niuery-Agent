@@ -2,9 +2,12 @@ import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "re
 import { createRoot } from "react-dom/client";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { diffLines } from "diff";
+import Editor, { loader } from "@monaco-editor/react";
+import * as monaco from "monaco-editor";
 import { Terminal } from "@xterm/xterm";
+import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
+import { diffLines } from "diff";
 import {
   Activity,
   AlertTriangle,
@@ -47,6 +50,10 @@ import {
 } from "lucide-react";
 import "./style.css";
 import type { Method } from "./protocol.generated";
+
+// 桌面应用通过 file:// 加载，Monaco 不能依赖默认的远程 CDN loader。
+// 显式绑定打包进应用的 monaco-editor，避免文件查看器永久停留在 Loading。
+loader.config({ monaco });
 
 type Run = {
   id: string;
@@ -113,11 +120,13 @@ declare global {
     agent: {
       request: (method: Method, payload?: object) => Promise<any>;
       chooseWorkspace: () => Promise<string | null>;
+      setWorkspace: (workspace: string) => Promise<void>;
       onEvent: (cb: (e: Event) => void) => () => void;
       onStatus: (cb: (s: string) => void) => () => void;
       openInExplorer: (path: string) => Promise<void>;
       startTerminal: (cwd: string) => Promise<{ id: string }>;
       writeTerminal: (id: string, data: string) => void;
+      resizeTerminal: (id: string, cols: number, rows: number) => void;
       closeTerminal: (id: string) => void;
       onTerminalData: (cb: (data: { id: string; data: string }) => void) => () => void;
       onTerminalExit: (cb: (data: { id: string; data: string }) => void) => () => void;
@@ -374,6 +383,35 @@ function languageFor(path: string) {
 function isMarkdownFile(path: string) { return /\.(md|markdown|mdown)$/i.test(path); }
 
 function WorkspacePanel({ mode, setMode, workspace, onClose }: { mode: WorkspaceMode; setMode: (mode: WorkspaceMode) => void; workspace: string; onClose: () => void }) {
+  type WorkspaceTab = { id: string; mode: Exclude<WorkspaceMode, "landing">; index: number };
+  const createId = () => `workspace-tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const [tabs, setTabs] = useState<WorkspaceTab[]>(() => mode === "landing" ? [] : [{ id: createId(), mode, index: 1 }]);
+  const [activeTabId, setActiveTabId] = useState(() => tabs[0]?.id || "");
+  const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(() => mode === "landing");
+  const activeTab = tabs.find((tab) => tab.id === activeTabId) || tabs[0];
+  const activeMode = activeTab?.mode || mode;
+  useEffect(() => {
+    if (mode === "landing") return;
+    const existing = tabs.find((tab) => tab.mode === mode);
+    if (existing) { setActiveTabId(existing.id); setWorkspaceMenuOpen(false); }
+    else {
+      const next = { id: createId(), mode, index: tabs.filter((tab) => tab.mode === mode).length + 1 };
+      setTabs((current) => [...current, next]);
+      setActiveTabId(next.id);
+      setWorkspaceMenuOpen(false);
+    }
+  }, [mode]);
+  const createTab = (nextMode: Exclude<WorkspaceMode, "landing">) => {
+    const next = { id: createId(), mode: nextMode, index: tabs.filter((tab) => tab.mode === nextMode).length + 1 };
+    setTabs((current) => [...current, next]); setActiveTabId(next.id); setWorkspaceMenuOpen(false); setMode(nextMode);
+  };
+  const showWorkspaceMenu = () => { setWorkspaceMenuOpen(true); setMode("landing"); };
+  const closeTab = (id: string) => {
+    if (tabs.length === 1) { setTabs([]); setActiveTabId(""); showWorkspaceMenu(); return; }
+    const index = tabs.findIndex((tab) => tab.id === id);
+    const remaining = tabs.filter((tab) => tab.id !== id); setTabs(remaining);
+    if (id === activeTabId) { const next = remaining[Math.max(0, index - 1)] || remaining[0]; setActiveTabId(next.id); setMode(next.mode); }
+  };
   const [review, setReview] = useState<{ branch: string; files: GitFile[]; totalAdditions: number; totalDeletions: number } | null>(null);
   const [reviewFile, setReviewFile] = useState<GitFile | null>(null);
   const [tree, setTree] = useState<TreeNode[]>([]);
@@ -389,26 +427,37 @@ function WorkspacePanel({ mode, setMode, workspace, onClose }: { mode: Workspace
   const terminalId = useRef<string | null>(null);
 
   const refreshReview = () => workspace && window.agent.request("workspace.gitDiff", { workspace }).then(setReview).then(() => setReviewFile(null)).catch((e: Error) => setFileError(e.message));
-  useEffect(() => { if (mode === "review") void refreshReview(); }, [mode, workspace]);
+  useEffect(() => { if (activeMode === "review") void refreshReview(); }, [activeMode, workspace]);
   useEffect(() => {
-    if (mode !== "files" || !workspace) return;
+    if (activeMode !== "files" || !workspace) return;
     window.agent.request("workspace.tree", { workspace }).then((result: { files: string[] }) => setTree(makeTree(result.files))).catch((e: Error) => setFileError(e.message));
-  }, [mode, workspace]);
+  }, [activeMode, workspace]);
   useEffect(() => {
-    if (mode !== "files" || !selectedFile || !workspace) return;
+    if (activeMode !== "files" || !selectedFile || !workspace) return;
     setFileError("");
     window.agent.request("workspace.read", { workspace, path: selectedFile, startLine: 1, lineCount: 400 }).then((result: { text: string }) => setFileText(result.text)).catch((e: Error) => setFileError(e.message));
-  }, [mode, selectedFile, workspace]);
+  }, [activeMode, selectedFile, workspace]);
   useEffect(() => {
-    if (mode !== "terminal" || !workspace || !terminalRef.current) return;
+    if (activeMode !== "terminal" || !workspace || !terminalRef.current) return;
     const terminal = new Terminal({ convertEol: true, cursorBlink: true, fontSize: 12, fontFamily: "'DM Mono', Consolas, monospace", theme: { background: "#10151d", foreground: "#d9e2ef", cursor: "#8fb3ff" } });
-    terminal.open(terminalRef.current); terminal.focus(); terminalInstance.current = terminal;
-    let alive = true;
-    window.agent.startTerminal(workspace).then(({ id }) => { if (!alive) return window.agent.closeTerminal(id); terminalId.current = id; terminal.onData((data) => window.agent.writeTerminal(id, data)); });
+    const fitAddon = new FitAddon();
+    terminal.loadAddon(fitAddon); terminal.open(terminalRef.current); fitAddon.fit(); terminal.focus(); terminalInstance.current = terminal;
+    let alive = true; let pendingInput = "";
+    const resize = () => { if (terminalId.current) window.agent.resizeTerminal(terminalId.current, terminal.cols, terminal.rows); };
+    const onInput = (data: string) => { if (!terminalId.current) pendingInput += data; else window.agent.writeTerminal(terminalId.current, data); };
+    terminal.onData(onInput);
+    window.agent.setWorkspace(workspace).then(() => window.agent.startTerminal(workspace)).then(({ id }) => {
+      if (!alive) return window.agent.closeTerminal(id);
+      terminalId.current = id;
+      resize();
+      if (pendingInput) { window.agent.writeTerminal(id, pendingInput); pendingInput = ""; }
+    }).catch((error: Error) => { if (alive) terminal.write(`\r\n[终端启动失败] ${error.message}\r\n`); });
     const offData = window.agent.onTerminalData(({ id, data }) => { if (id === terminalId.current) terminal.write(data); });
-    const offExit = window.agent.onTerminalExit(({ id }) => { if (id === terminalId.current) terminal.write("\\r\\n[终端已退出]\\r\\n"); });
-    return () => { alive = false; if (terminalId.current) window.agent.closeTerminal(terminalId.current); terminalId.current = null; offData(); offExit(); terminal.dispose(); terminalInstance.current = null; };
-  }, [mode, workspace]);
+    const offExit = window.agent.onTerminalExit(({ id }) => { if (id === terminalId.current) terminal.write("\r\n[终端已退出]\r\n"); });
+    const observer = new ResizeObserver(() => { fitAddon.fit(); resize(); });
+    observer.observe(terminalRef.current);
+    return () => { alive = false; observer.disconnect(); if (terminalId.current) window.agent.closeTerminal(terminalId.current); terminalId.current = null; offData(); offExit(); terminal.dispose(); terminalInstance.current = null; };
+  }, [activeMode, workspace]);
 
   const openBrowser = () => { const value = browserInput.trim(); if (!value) return; const target = /^https?:\/\//i.test(value) ? value : `https://www.google.com/search?q=${encodeURIComponent(value)}`; setBrowserUrl(target); };
   const filteredTree = (nodes: TreeNode[]): TreeNode[] => nodes.flatMap((node) => {
@@ -418,14 +467,14 @@ function WorkspacePanel({ mode, setMode, workspace, onClose }: { mode: Workspace
   });
   const renderTree = (nodes: TreeNode[], depth = 0): React.ReactNode => nodes.map((node) => <React.Fragment key={node.path}><button className={`tree-row ${selectedFile === node.path ? "selected" : ""}`} style={{ paddingLeft: 12 + depth * 15 }} onClick={() => node.directory ? setExpandedTree((old) => ({ ...old, [node.path]: !old[node.path] })) : setSelectedFile(node.path)}>{node.directory ? (expandedTree[node.path] ? <ChevronDown size={14} /> : <ChevronRight size={14} />) : <span className="tree-spacer" />}{node.directory ? <Folder size={14} /> : <FileText size={14} />}<span>{node.name}</span></button>{node.directory && expandedTree[node.path] && renderTree(node.children, depth + 1)}</React.Fragment>);
 
-  const navItems: Array<[WorkspaceMode, React.ReactNode, string, string]> = [["review", <FileDiff size={16} />, "审查", "Ctrl+Shift+G"], ["terminal", <SquareTerminal size={16} />, "终端", "Ctrl+`"], ["browser", <Globe size={16} />, "浏览器", "Ctrl+T"], ["files", <FolderOpen size={16} />, "文件", "Ctrl+P"]];
-  if (mode === "landing") return <div className="workspace-landing"><div className="workspace-landing-actions"><button onClick={onClose} aria-label="关闭工作区"><ChevronRight size={17} /></button></div><div className="workspace-menu">{navItems.map(([key, icon, label, shortcut]) => <button key={key} onClick={() => setMode(key)}><span className="workspace-menu-icon">{icon}</span><span>{label}</span><kbd>{shortcut}</kbd></button>)}</div></div>;
+  const navItems: Array<[Exclude<WorkspaceMode, "landing">, React.ReactNode, string, string]> = [["review", <FileDiff size={16} />, "审查", "Ctrl+Shift+G"], ["terminal", <SquareTerminal size={16} />, "终端", "Ctrl+`"], ["browser", <Globe size={16} />, "浏览器", "Ctrl+T"], ["files", <FolderOpen size={16} />, "文件", "Ctrl+P"]];
+  if (workspaceMenuOpen || (mode === "landing" && !activeTab)) return <div className="workspace-landing"><div className="workspace-landing-actions"><div><strong>新建工作区标签</strong><span>选择一个功能，在右侧打开新的标签页</span></div><button onClick={onClose} aria-label="收起工作区"><ChevronRight size={17} /></button></div><div className="workspace-menu">{navItems.map(([key, icon, label, shortcut]) => <button key={key} onClick={() => createTab(key)}><span className="workspace-menu-icon">{icon}</span><span className="workspace-menu-copy"><strong>{label}</strong><small>{key === "review" ? "查看代码变更与差异" : key === "terminal" ? "打开 PowerShell 工作会话" : key === "browser" ? "在内置浏览器中访问网页" : "浏览和查看工作区文件"}</small></span><kbd>{shortcut}</kbd><ChevronRight size={15} className="workspace-menu-arrow" /></button>)}</div></div>;
   return <div className={`workspace-panel workspace-${mode}`}>
-    <header className="workspace-header"><div className="workspace-tabs">{navItems.map(([key, icon, label]) => <button key={key} className={mode === key ? "active" : ""} onClick={() => setMode(key)}>{icon}{label}</button>)}</div><button className="workspace-close" onClick={onClose} aria-label="关闭工作区"><ChevronRight size={17} /></button></header>
+    <header className="workspace-header"><div className="workspace-tabs" role="tablist" aria-label="工作区标签页">{tabs.map((tab) => { const item = navItems.find(([key]) => key === tab.mode)!; const selected = tab.id === activeTab?.id; return <div className={`workspace-tab ${selected ? "active" : ""}`} key={tab.id}><button role="tab" aria-selected={selected} title={`${item[2]}标签页 ${tab.index}`} onClick={() => { setActiveTabId(tab.id); setMode(tab.mode); }}>{item[1]}{item[2]} {tab.index}</button><button className="workspace-tab-close" onClick={() => closeTab(tab.id)} aria-label={`关闭${item[2]}标签页`} title={`关闭${item[2]}标签页`}><X size={12} /></button></div>; })}<button className="workspace-tab-add" onClick={showWorkspaceMenu} aria-label="新建标签页" title="新建标签页"><Plus size={15} /></button></div><button className="workspace-close" onClick={onClose} aria-label="收起工作区" title="收起工作区"><ChevronRight size={17} /></button></header>
     {mode === "review" && <div className="review-workspace"><div className="review-main"><div className="workspace-toolbar"><div><strong>审查</strong><span>{review?.branch || "当前工作区"}</span></div><button onClick={() => void refreshReview()}><RefreshCw size={14} /> 刷新</button></div><div className="review-stats"><b>+{review?.totalAdditions || 0}</b><b>−{review?.totalDeletions || 0}</b><span>{review?.files.length || 0} 个文件</span></div>{reviewFile ? <div className="review-diff"><div className="review-file-title"><FileText size={14} /> {reviewFile.path}</div><div className="diff-preview review-diff-preview">{buildDiffLines(reviewFile.before, reviewFile.after).lines.map((line, index) => <div className={`diff-line ${line.kind}`} key={`${index}-${line.text}`}><span className="diff-gutter">{line.kind === "removed" ? line.oldNumber : ""}</span><span className="diff-gutter">{line.kind === "added" ? line.newNumber : line.kind === "context" ? line.newNumber : ""}</span><span className="diff-marker">{line.kind === "removed" ? "−" : line.kind === "added" ? "+" : " "}</span><code>{line.text || " "}</code></div>)}</div></div> : <div className="workspace-empty"><GitBranch size={28} /><strong>{review ? (review.files.length ? "选择文件查看差异" : "工作区干净") : "正在读取 Git 差异…"}</strong></div>}</div><aside className="review-files"><div className="section-caption">变更文件</div>{review?.files.map((file) => <button className={`review-file-row ${reviewFile?.path === file.path ? "selected" : ""}`} key={file.path} onClick={() => setReviewFile(file)}><span className={`git-status status-${file.status[0] || "M"}`}>{file.status[0] || "M"}</span><span>{file.path}</span><em>+{file.additions} −{file.deletions}</em></button>)}</aside></div>}
     {mode === "terminal" && <div className="terminal-shell"><div ref={terminalRef} className="terminal-host" /></div>}
     {mode === "browser" && <div className="browser-shell"><div className="browser-toolbar"><button onClick={() => (document.querySelector(".embedded-browser") as any)?.goBack()}><ArrowLeft size={15} /></button><button onClick={() => (document.querySelector(".embedded-browser") as any)?.goForward()}><ArrowRight size={15} /></button><button onClick={() => (document.querySelector(".embedded-browser") as any)?.reload()}><RefreshCw size={15} /></button><form onSubmit={(e) => { e.preventDefault(); openBrowser(); }}><Globe size={14} /><input value={browserInput} onChange={(e) => setBrowserInput(e.target.value)} placeholder="搜索或输入网址" /></form><button onClick={() => browserUrl && window.agent.openInExplorer(browserUrl)} title="在系统浏览器打开"><ExternalLink size={15} /></button></div>{browserUrl ? React.createElement("webview", { className: "embedded-browser", src: browserUrl, allowpopups: true }) : <div className="workspace-empty"><Globe size={32} /><strong>开始浏览</strong><span>输入 URL 以打开页面</span></div>}</div>}
-    {mode === "files" && <div className="files-workspace"><div className="file-editor"><div className="file-editor-head"><div><strong>{selectedFile ? selectedFile.split(/[\\/]/).pop() : "未选择文件"}</strong><span>{selectedFile || "从右侧文件树选择文件"}</span></div>{selectedFile && <button onClick={() => void window.agent.openInExplorer(`${workspace}/${selectedFile}`)}><ExternalLink size={14} /> 打开</button>}</div>{fileError ? <div className="workspace-error">{fileError}</div> : selectedFile ? (isMarkdownFile(selectedFile) ? <div className="file-markdown answer"><MarkdownAnswer content={fileText} /></div> : <pre className="file-code">{fileText.split("\n").map((line, index) => <span className="file-code-line" key={index}><i>{index + 1}</i><code>{line || " "}</code></span>)}</pre>) : <div className="workspace-empty"><FileText size={28} /><strong>选择一个文件</strong></div>}</div><aside className="file-tree"><div className="file-tree-search"><Search size={14} /><input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="筛选文件…" /></div><div className="tree-list">{renderTree(filteredTree(tree))}</div></aside></div>}
+    {mode === "files" && <div className="files-workspace"><div className="file-editor"><div className="file-editor-head"><div><strong>{selectedFile ? selectedFile.split(/[\\/]/).pop() : "未选择文件"}</strong><span>{selectedFile || "从右侧文件树选择文件"}</span></div>{selectedFile && <button onClick={() => void window.agent.openInExplorer(`${workspace}/${selectedFile}`)}><ExternalLink size={14} /> 打开</button>}</div>{fileError ? <div className="workspace-error">{fileError}</div> : selectedFile ? <div className="file-code-editor"><Editor height="100%" language={languageFor(selectedFile)} value={fileText} theme="vs-light" options={{ readOnly: true, automaticLayout: true, minimap: { enabled: false }, fontFamily: "'DM Mono', Consolas, monospace", fontSize: 12, lineHeight: 20, lineNumbers: "on", folding: true, renderWhitespace: "selection", scrollBeyondLastLine: false, wordWrap: "off", padding: { top: 14, bottom: 28 } }} /></div> : <div className="workspace-empty"><FileText size={28} /><strong>选择一个文件</strong></div>}</div><aside className="file-tree"><div className="file-tree-search"><Search size={14} /><input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="筛选文件…" /></div><div className="tree-list">{renderTree(filteredTree(tree))}</div></aside></div>}
   </div>;
 }
 
@@ -497,6 +546,9 @@ function App() {
   }, []);
   useEffect(() => { localStorage.setItem("projects", JSON.stringify(projects)); }, [projects]);
   useEffect(() => { localStorage.setItem("activeProjectId", activeProjectId); }, [activeProjectId]);
+  useEffect(() => {
+    if (workspace) void window.agent.setWorkspace(workspace).catch(() => undefined);
+  }, [workspace]);
   useEffect(() => {
     if (projects.length === 0 && workspace) {
       const name = workspace.split(/[\\/]/).filter(Boolean).pop() || workspace;

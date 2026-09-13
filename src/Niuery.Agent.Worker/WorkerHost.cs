@@ -316,6 +316,9 @@ public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration>
             var repoPath = raw[3..].Trim();
             if (repoPath.Contains(" -> ", StringComparison.Ordinal)) repoPath = repoPath[(repoPath.LastIndexOf(" -> ", StringComparison.Ordinal) + 4)..];
             var path = repoPrefix.Length > 0 && repoPath.StartsWith(repoPrefix, StringComparison.Ordinal) ? repoPath[repoPrefix.Length..] : repoPath;
+            // 即使文件已经被 Git 跟踪，.gitignore 规则仍可能明确将其标记为忽略。
+            // 审查视图应遵循当前仓库的忽略规则，避免把 bin/obj 等生成物展示出来。
+            if (await IsGitIgnored(root, repoPath)) continue;
             var full = Path.Combine(root, path);
             var after = File.Exists(full) ? await File.ReadAllTextAsync(full) : "";
             var beforeResult = await WorkspaceTools.Execute("git", ["show", $"HEAD:{repoPath}"], root, CancellationToken.None);
@@ -327,6 +330,11 @@ public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration>
             files.Add(new { path, status = code.Trim(), before, after, additions, deletions });
         }
         return new { branch = branchResult.Output.Trim(), files, totalAdditions = files.Sum(x => (int)x.GetType().GetProperty("additions")!.GetValue(x)!), totalDeletions = files.Sum(x => (int)x.GetType().GetProperty("deletions")!.GetValue(x)!) };
+    }
+    private static async Task<bool> IsGitIgnored(string root, string path)
+    {
+        var result = await WorkspaceTools.Execute("git", ["check-ignore", "--no-index", "--quiet", "--", path], root, CancellationToken.None);
+        return result.ExitCode == 0;
     }
     private static int CountLines(string text) => string.IsNullOrEmpty(text) ? 0 : text.Replace("\r\n", "\n").Split('\n').Length - (text.EndsWith('\n') ? 1 : 0);
     private object Start(JsonElement payload)

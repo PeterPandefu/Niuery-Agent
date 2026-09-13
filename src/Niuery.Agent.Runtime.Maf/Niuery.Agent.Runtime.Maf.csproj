@@ -3,4 +3,10 @@
     <PackageReference Include="Microsoft.Agents.AI.Harness" Version="1.21.0" />
     <PackageReference Include="Microsoft.Extensions.AI.OpenAI" Version="10.3.0" />
   </ItemGroup>
+
+  <ItemGroup>
+    <!-- artifacts 目录只保存验证产物，不能作为项目源码参与编译。 -->
+    <Compile Remove="artifacts\**\*.cs" />
+    <None Include="artifacts\**" />
+  </ItemGroup>
 </Project>

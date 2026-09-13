@@ -1,6 +1,7 @@
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const { shell } = require('electron');
 const { spawn, spawnSync } = require('node:child_process');
+const pty = require('node-pty');
 const { createInterface } = require('node:readline');
 const path = require('node:path');
 const crypto = require('node:crypto');
@@ -67,6 +68,12 @@ app.whenReady().then(() => {
     selectedWorkspace = path.resolve(result.filePaths[0]);
     return selectedWorkspace;
   });
+  ipcMain.handle('workspace:set', async (event, workspace) => {
+    if (event.sender !== window.webContents || typeof workspace !== 'string' || !path.isAbsolute(workspace)) throw new Error('工作区目录无效。');
+    const resolvedWorkspace = path.resolve(workspace);
+    if (!require('node:fs').existsSync(resolvedWorkspace)) throw new Error('工作区目录不存在。');
+    selectedWorkspace = resolvedWorkspace;
+  });
   ipcMain.handle('workspace:open', async (event, target) => { if (event.sender !== window.webContents) throw new Error('窗口不被允许。'); await shell.openPath(target); });
   ipcMain.handle('terminal:start', async (event, cwd) => {
     if (event.sender !== window.webContents || typeof cwd !== 'string' || !path.isAbsolute(cwd)) throw new Error('终端目录无效。');
@@ -74,21 +81,36 @@ app.whenReady().then(() => {
     if (!selectedWorkspace || (resolvedCwd !== selectedWorkspace && !resolvedCwd.startsWith(selectedWorkspace + path.sep))) throw new Error('终端只能在当前工作区内启动。');
     if (!require('node:fs').existsSync(resolvedCwd)) throw new Error('终端目录不存在。');
     const id = crypto.randomUUID();
-    const child = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass'], { cwd: resolvedCwd, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = pty.spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass'], {
+      name: 'xterm-256color',
+      cols: 80,
+      rows: 24,
+      cwd: resolvedCwd,
+      env: process.env,
+      useConpty: true,
+    });
     terminals.set(id, child);
     const send = (type, data) => window?.webContents.send(`terminal:${type}`, { id, data });
-    child.stdout.on('data', data => send('data', data.toString()));
-    child.stderr.on('data', data => send('data', data.toString()));
-    child.on('exit', code => { send('exit', String(code ?? 0)); terminals.delete(id); });
+    child.onData(data => send('data', data));
+    child.onExit(({ exitCode }) => { send('exit', String(exitCode ?? 0)); terminals.delete(id); });
     return { id };
   });
   if (typeof ipcMain.on === 'function') {
-    ipcMain.on('terminal:write', (event, id, data) => { if (event.sender === window.webContents && terminals.get(id)?.stdin.writable && typeof data === 'string') terminals.get(id).stdin.write(data); });
+    ipcMain.on('terminal:write', (event, id, data) => {
+      if (event.sender === window.webContents && terminals.get(id) && typeof data === 'string') terminals.get(id).write(data);
+    });
+    ipcMain.on('terminal:resize', (event, id, cols, rows) => {
+      if (event.sender === window.webContents && terminals.get(id) && Number.isInteger(cols) && Number.isInteger(rows) && cols > 0 && rows > 0) {
+        terminals.get(id).resize(cols, rows);
+      }
+    });
     ipcMain.on('terminal:close', (event, id) => { if (event.sender === window.webContents) { const child = terminals.get(id); if (child) { child.kill(); terminals.delete(id); } } });
   }
   startWorker(); window.loadFile(path.join(__dirname, '../dist/index.html'));
 });
 app.on('before-quit', event => {
+  for (const terminal of terminals.values()) terminal.kill();
+  terminals.clear();
   if (stopping || !worker || worker.exitCode !== null) return;
   event.preventDefault(); stopping = true;
   request('worker.shutdown').catch(() => {}).finally(() => worker.stdin.end());

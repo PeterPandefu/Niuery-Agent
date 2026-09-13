@@ -11,15 +11,18 @@
     "test:desktop": "node scripts/smoke.cjs",
     "test:ipc-allowlist": "node scripts/ipc-allowlist.cjs",
     "test:conversation": "node scripts/conversation.cjs",
-    "test:project-continuation": "node scripts/project-continuation.cjs"
+    "test:project-continuation": "node scripts/project-continuation.cjs",
+    "test:terminal": "electron scripts/verify-terminal.cjs"
   },
   "dependencies": {
     "@monaco-editor/react": "4.7.0",
+    "@xterm/addon-fit": "^0.10.0",
     "@xterm/xterm": "5.5.0",
     "diff": "^7.0.0",
     "lucide-react": "0.468.0",
     "mermaid": "^11.12.1",
     "monaco-editor": "0.52.2",
+    "node-pty": "^1.1.0",
     "react": "19.0.0",
     "react-dom": "19.0.0",
     "react-markdown": "^10.1.0",
