@@ -470,6 +470,21 @@ input:focus-visible {
   background: #fff0ef;
   color: var(--red);
 }
+.mode-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 5px 8px;
+  border-radius: 20px;
+  font-weight: 600;
+}
+.mode-badge.plan {
+  background: #eef3ff;
+  color: #315acb;
+}
+.mode-badge.execute {
+  background: #e9f7f1;
+  color: #198754;
+}
 .review-toggle {
   display: flex;
   align-items: center;
@@ -519,11 +534,136 @@ input:focus-visible {
 }
 .answer {
   margin-top: 8px;
-  white-space: pre-wrap;
   line-height: 1.85;
   color: #29364d;
   font-size: 13px;
   overflow-wrap: anywhere;
+}
+.answer > :first-child {
+  margin-top: 0;
+}
+.answer > :last-child {
+  margin-bottom: 0;
+}
+.answer p {
+  margin: 0 0 12px;
+}
+.answer h1,
+.answer h2,
+.answer h3,
+.answer h4,
+.answer h5,
+.answer h6 {
+  margin: 18px 0 8px;
+  color: #253653;
+  line-height: 1.4;
+  font-weight: 650;
+}
+.answer h1 { font-size: 19px; }
+.answer h2 { font-size: 17px; }
+.answer h3 { font-size: 15px; }
+.answer h4,
+.answer h5,
+.answer h6 { font-size: 13px; }
+.answer ul,
+.answer ol {
+  margin: 8px 0 14px;
+  padding-left: 24px;
+}
+.answer li { padding-left: 3px; }
+.answer li + li { margin-top: 4px; }
+.answer blockquote {
+  margin: 12px 0;
+  padding: 3px 14px;
+  border-left: 3px solid #b7c8ef;
+  color: #66758e;
+  background: #f7f9fd;
+}
+.answer a {
+  color: #315acb;
+  text-decoration: underline;
+  text-decoration-color: #b7c8ef;
+  text-underline-offset: 2px;
+}
+.answer code {
+  padding: 2px 5px;
+  border-radius: 4px;
+  background: #f0f3f8;
+  color: #475a7a;
+  font: 0.9em "DM Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.answer pre {
+  overflow-x: auto;
+  margin: 12px 0 14px;
+  padding: 12px 14px;
+  border: 1px solid #e2e7ef;
+  border-radius: 7px;
+  background: #f7f9fc;
+  line-height: 1.6;
+}
+.answer pre code {
+  display: block;
+  padding: 0;
+  background: transparent;
+  color: #33415b;
+  font-size: 12px;
+  white-space: pre;
+}
+.answer hr {
+  margin: 18px 0;
+  border: 0;
+  border-top: 1px solid #e7ebf1;
+}
+.answer table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  margin: 12px 0 14px;
+  border-collapse: collapse;
+  white-space: nowrap;
+}
+.answer th,
+.answer td {
+  padding: 7px 10px;
+  border: 1px solid #dfe5ee;
+  text-align: left;
+}
+.answer th {
+  background: #f4f6fa;
+  color: #43536e;
+  font-weight: 650;
+}
+.mermaid-block {
+  overflow: auto;
+  margin: 14px 0;
+  padding: 14px;
+  border: 1px solid #e2e7ef;
+  border-radius: 8px;
+  background: #fbfcfe;
+}
+.mermaid-diagram {
+  display: flex;
+  justify-content: center;
+  min-width: min-content;
+}
+.mermaid-diagram svg {
+  max-width: 100%;
+  height: auto;
+}
+.mermaid-error {
+  color: #a34843;
+  font-size: 11px;
+}
+.mermaid-error summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.mermaid-error p {
+  margin: 8px 0;
+  line-height: 1.6;
+}
+.mermaid-error pre {
+  margin: 8px 0 0;
 }
 .thinking {
   display: flex;
@@ -641,10 +781,33 @@ input:focus-visible {
   display: flex;
   align-items: center;
   gap: 7px;
+  width: fit-content;
+  padding: 3px 5px;
+  margin: -3px 0 10px -5px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
   color: #7b879a;
   font-size: 11px;
   font-weight: 600;
-  margin-bottom: 13px;
+  line-height: 1.4;
+  cursor: pointer;
+  transition: color .15s ease, background-color .15s ease;
+}
+.timeline-title:hover,
+.timeline-title:focus-visible {
+  color: #315acb;
+  background: #f2f5fc;
+  outline: none;
+}
+.timeline-latest {
+  max-width: min(52vw, 420px);
+  overflow: hidden;
+  color: #a0a9b7;
+  font-size: 10px;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .timeline-item {
   display: flex;
@@ -715,12 +878,18 @@ input:focus-visible {
   gap: 11px;
   margin-top: 8px;
 }
+.mode-select,
 .model-select {
   display: flex;
   align-items: center;
   gap: 6px;
   color: #758197;
 }
+.mode-select {
+  padding-right: 11px;
+  border-right: 1px solid #edf0f4;
+}
+.mode-select select,
 .model-select select {
   max-width: 190px;
   border: 0;
@@ -728,6 +897,11 @@ input:focus-visible {
   color: #53627b;
   font-size: 11px;
   outline: 0;
+}
+.mode-select select {
+  max-width: 112px;
+  color: #536da7;
+  font-weight: 600;
 }
 .composer-hint {
   color: #a0a9b6;
@@ -746,6 +920,20 @@ input:focus-visible {
 .send-button.stop {
   background: #fff0ef;
   color: var(--red);
+}
+.approve-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 7px 10px;
+  border-radius: 7px;
+  background: #315acb;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+}
+.approve-button:disabled {
+  opacity: .55;
 }
 .composer-note {
   display: flex;

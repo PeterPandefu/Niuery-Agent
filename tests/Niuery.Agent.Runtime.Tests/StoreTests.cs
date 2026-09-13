@@ -4,6 +4,34 @@ namespace Niuery.Agent.Runtime.Tests;
 
 public sealed class StoreTests
 {
+    [Fact(DisplayName = "任务状态保存并恢复模式和会话快照")]
+    public void TaskStateRoundTrip()
+    {
+        var directory = Directory.CreateTempSubdirectory("niuery-task-state-").FullName;
+        using var store = new Store(Path.Combine(directory, "test.db"));
+
+        store.SaveTaskState("task-1", "plan", "{\"history\":[]}");
+        var initial = store.LoadTaskState("task-1");
+        Assert.NotNull(initial);
+        Assert.Equal("plan", initial.Mode);
+        Assert.Equal("{\"history\":[]}", initial.SessionJson);
+
+        store.SaveTaskState("task-1", "execute", "{\"history\":[1]}");
+        var updated = store.LoadTaskState("task-1");
+        Assert.NotNull(updated);
+        Assert.Equal("execute", updated.Mode);
+        Assert.Equal("{\"history\":[1]}", updated.SessionJson);
+    }
+
+    [Fact(DisplayName = "任务状态拒绝未知模式")]
+    public void TaskStateRejectsUnknownMode()
+    {
+        var directory = Directory.CreateTempSubdirectory("niuery-task-state-invalid-").FullName;
+        using var store = new Store(Path.Combine(directory, "test.db"));
+
+        Assert.Throws<InvalidOperationException>(() => store.SaveTaskState("task-1", "goal", null));
+    }
+
     [Fact(DisplayName = "并发事件序号唯一且重开保留终态并标记中断")]
     public void PersistAndRecover()
     {

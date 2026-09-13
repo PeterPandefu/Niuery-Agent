@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
+using Microsoft.Agents.AI;
 using Niuery.Agent.Runtime.Maf;
 using Microsoft.Extensions.AI;
 
@@ -16,7 +17,7 @@ public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration>
     {
         object result = method switch
         {
-            "hello" => new { version = 1, name = "Niuery Agent", capabilities = new[] { "streaming", "cancel", "history", "project.open", "chat.start", "workspace.diff" } },
+            "hello" => new { version = 1, name = "Niuery Agent", capabilities = new[] { "streaming", "cancel", "history", "project.open", "chat.start", "mode.get", "mode.set", "workspace.diff" } },
             "project.open" => await OpenProject(payload),
             "providers.list" => providers.Select(p => new { p.Id, p.Kind, p.BaseUrl, p.Model, Models = p.AvailableModels, p.ApiKey, p.SupportsTools, p.SupportsStreaming, p.TimeoutSeconds, p.Enabled }).ToArray(),
             "providers.save" => await SaveProviders(payload),
@@ -28,6 +29,8 @@ public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration>
             "chat.start" => StartChat(payload),
             "task.delete" => DeleteTask(payload.Required("taskId")),
             "run.continue" => Continue(payload),
+            "mode.get" => GetMode(payload.Required("taskId")),
+            "mode.set" => SetMode(payload.Required("taskId"), payload.Required("mode")),
             "run.cancel" => Cancel(payload.Required("runId")),
             "approval.respond" => Approvals.Respond(payload.Required("runId"), payload.Required("approvalId"), payload.Required("digest"), payload.GetProperty("approved").GetBoolean()),
             "workspace.diff" => GetWorkspaceDiff(payload),
@@ -165,9 +168,32 @@ public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration>
         var parentId = payload.Required("runId");
         var parent = store.History().SingleOrDefault(r => r.Id == parentId)
             ?? throw new InvalidOperationException("找不到要继续的任务。");
-        if (parent.Kind == "chat" ? parent.Status is not ("completed" or "interrupted") : parent.Status != "interrupted") throw new InvalidOperationException("只有已完成或被中断的对话可以继续执行；失败任务已停止。");
+        if (parent.Status is not ("completed" or "interrupted")) throw new InvalidOperationException("只有已完成或被中断的任务可以继续执行；失败任务已停止。");
         var workspace = parent.Kind == "chat" ? (payload.TryGetProperty("workspace", out var value) ? value.GetString() ?? "" : "") : parent.Workspace;
-        return Start(payload, parentId, workspace, parent.Provider, parent.Kind);
+        return Start(payload, parentId, workspace, parent.Provider, parent.Kind, parent.TaskId);
+    }
+
+    private object GetMode(string taskId)
+    {
+        if (!store.History(1000).Any(run => run.TaskId == taskId))
+            throw new InvalidOperationException("找不到指定任务。");
+        return new { taskId, mode = store.LoadTaskState(taskId)?.Mode ?? "plan" };
+    }
+
+    private object SetMode(string taskId, string mode)
+    {
+        ValidateMode(mode);
+        var taskRuns = store.History(1000).Where(run => run.TaskId == taskId).ToArray();
+        if (taskRuns.Length == 0) throw new InvalidOperationException("找不到指定任务。");
+        if (taskRuns.Any(run => active.ContainsKey(run.Id)))
+            throw new InvalidOperationException("任务执行中不能切换模式，请等待任务完成。");
+        var current = store.LoadTaskState(taskId);
+        var previous = current?.Mode ?? "plan";
+        if (previous == mode) return new { taskId, mode };
+        store.SaveTaskState(taskId, mode, current?.SessionJson);
+        var run = taskRuns.OrderByDescending(item => item.Created).First();
+        Emit(run.Id, "mode.changed", new { from = previous, to = mode, source = "user", message = $"已从 {previous} 模式切换到 {mode} 模式。" });
+        return new { taskId, mode };
     }
 
     private static Task<object> OpenProject(JsonElement payload)
@@ -216,7 +242,7 @@ public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration>
         return Start(payload, null, payload.Required("workspace"), payload.Required("providerId"), "project");
     }
     private object StartChat(JsonElement payload) => Start(payload, null, payload.TryGetProperty("workspace", out var w) && w.ValueKind == JsonValueKind.String ? w.GetString() ?? "" : "", payload.Required("providerId"), "chat");
-    private object Start(JsonElement payload, string? parentId, string workspaceValue, string providerId, string kind)
+    private object Start(JsonElement payload, string? parentId, string workspaceValue, string providerId, string kind, string? taskId = null)
     {
         if (!active.IsEmpty) throw new InvalidOperationException("首版本地执行器一次只运行一个任务，请等待或取消当前执行。");
         var workspace = string.IsNullOrWhiteSpace(workspaceValue) ? "" : Path.GetFullPath(workspaceValue);
@@ -232,12 +258,31 @@ public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration>
         provider.Validate(); provider.ResolveApiKey();
         var prompt = payload.Required("prompt");
         if (prompt.Length > 32000) throw new InvalidOperationException("任务说明过长，请控制在 32000 字符内。");
+        var mode = ResolveMode(payload, taskId);
         var row = store.Create(kind, workspace, prompt, provider.Id, parentId);
+        var previousState = store.LoadTaskState(row.TaskId);
+        store.SaveTaskState(row.TaskId, mode, previousState?.SessionJson);
+        if (previousState is not null && previousState.Mode != mode)
+            Emit(row.Id, "mode.changed", new { from = previousState.Mode, to = mode, source = "user", message = $"已从 {previousState.Mode} 模式切换到 {mode} 模式。" });
         var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(provider.TimeoutSeconds));
         var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var task = Task.Run(async () => { await ready.Task; await Run(row, provider, cancellation.Token); });
         active[row.Id] = (cancellation, task); ready.SetResult();
         return row;
+    }
+
+    private string ResolveMode(JsonElement payload, string? taskId)
+    {
+        if (payload.TryGetProperty("mode", out var modeValue) && modeValue.ValueKind == JsonValueKind.String)
+            return ValidateMode(modeValue.GetString());
+        return taskId is null ? "plan" : ValidateMode(store.LoadTaskState(taskId)?.Mode ?? "plan");
+    }
+
+    private static string ValidateMode(string? mode)
+    {
+        if (mode is not ("plan" or "execute"))
+            throw new InvalidOperationException("任务模式必须是 plan 或 execute。");
+        return mode;
     }
     private void Emit(string runId, string type, object payload, string? status = null)
     {
@@ -248,17 +293,38 @@ public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration>
     {
         var status = "completed";
         var message = "执行完成。";
+        AIAgent? agent = null;
+        AgentSession? session = null;
+        var restored = false;
         try
         {
             Emit(row.Id, "run.started", new { message = "执行已开始。", provider.Model, processId = Environment.ProcessId, startedAt = DateTimeOffset.UtcNow });
             using var client = HarnessFactory.CreateClient(provider);
             var tools = string.IsNullOrWhiteSpace(row.Workspace) ? null : new WorkspaceTools(row.Workspace, (name, arguments, ct) => Approvals.Require(row.Id, name, arguments, ct),
                 (type, body) => Emit(row.Id, type, body), token);
-            var agent = row.Kind == "chat" ? HarnessFactory.CreateChat(client, tools?.Functions() ?? [], tools is not null) : HarnessFactory.CreateCoding(client, tools!.Functions());
-            var session = await agent.CreateSessionAsync(token);
+            var taskState = store.LoadTaskState(row.TaskId);
+            var mode = ValidateMode(taskState?.Mode ?? "plan");
+            agent = row.Kind == "chat" ? HarnessFactory.CreateChat(client, tools?.Functions() ?? [], tools is not null, mode) : HarnessFactory.CreateCoding(client, tools!.Functions(), mode);
+            if (!string.IsNullOrWhiteSpace(taskState?.SessionJson))
+            {
+                try
+                {
+                    var snapshot = JsonSerializer.Deserialize<JsonElement>(taskState.SessionJson);
+                    session = await agent.DeserializeSessionAsync(snapshot, cancellationToken: token);
+                    restored = true;
+                    Emit(row.Id, "session.restored", new { message = "已恢复任务会话。" });
+                }
+                catch (Exception)
+                {
+                    Emit(row.Id, "session.restore.failed", new { message = "任务会话恢复失败，已创建新会话。" });
+                }
+            }
+            session ??= await agent.CreateSessionAsync(token);
+            var modeProvider = agent.GetService<AgentModeProvider>();
+            if (modeProvider is not null) await modeProvider.SetModeAsync(session, mode, token);
             var pending = new StringBuilder();
             var messages = new List<ChatMessage>();
-            if (row.Kind == "chat")
+            if (!restored && row.Kind == "chat")
             {
                 foreach (var previous in store.History(1000).Where(r => r.TaskId == row.TaskId && r.Id != row.Id).OrderBy(r => r.Created))
                 {
@@ -277,9 +343,25 @@ public sealed class WorkerHost(Store store, IReadOnlyList<ProviderConfiguration>
             token.ThrowIfCancellationRequested();
         }
         catch (OperationCanceledException) { status = "cancelled"; message = "执行已取消或超时。"; }
-        catch (Exception) { status = "failed"; message = "执行失败，请检查模型服务和配置。"; }
+        catch (Exception ex) { status = "failed"; message = $"执行失败：{ex.Message}"; }
         finally
         {
+            if (agent is not null && session is not null)
+            {
+                try
+                {
+                    var modeProvider = agent.GetService<AgentModeProvider>();
+                    var mode = modeProvider is null ? (store.LoadTaskState(row.TaskId)?.Mode ?? "plan") : await modeProvider.GetModeAsync(session, CancellationToken.None);
+                    var snapshot = await agent.SerializeSessionAsync(session, cancellationToken: CancellationToken.None);
+                    store.SaveTaskState(row.TaskId, ValidateMode(mode), snapshot.GetRawText());
+                }
+                catch (Exception ex)
+                {
+                    status = "failed";
+                    message = $"任务状态保存失败：{ex.Message}";
+                    Emit(row.Id, "session.save.failed", new { message });
+                }
+            }
             if (active.TryRemove(row.Id, out var run)) run.Cancellation.Dispose();
             Emit(row.Id, "run." + status, new { message }, status);
         }

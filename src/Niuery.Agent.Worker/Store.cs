@@ -12,7 +12,7 @@ public sealed class Store : IDisposable
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
         connection = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = path }.ToString());
         connection.Open();
-        Execute("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY, taskId TEXT NOT NULL, parentId TEXT, workspace TEXT NOT NULL DEFAULT '', prompt TEXT NOT NULL, provider TEXT NOT NULL, status TEXT NOT NULL, created TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'project'); CREATE TABLE IF NOT EXISTS events(runId TEXT NOT NULL, sequence INTEGER NOT NULL, type TEXT NOT NULL, timestamp TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(runId,sequence));");
+        Execute("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY, taskId TEXT NOT NULL, parentId TEXT, workspace TEXT NOT NULL DEFAULT '', prompt TEXT NOT NULL, provider TEXT NOT NULL, status TEXT NOT NULL, created TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'project'); CREATE TABLE IF NOT EXISTS events(runId TEXT NOT NULL, sequence INTEGER NOT NULL, type TEXT NOT NULL, timestamp TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(runId,sequence)); CREATE TABLE IF NOT EXISTS task_state(taskId TEXT PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'plan', sessionJson TEXT, updatedAt TEXT NOT NULL);");
         try { Execute("ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'project'"); } catch (SqliteException) { }
         foreach (var run in History().Where(r => r.Status == "running"))
             Append(run.Id, "run.interrupted", new { message = "执行器退出，执行已中断。继续前请检查工作区差异。" }, "interrupted");
@@ -44,10 +44,38 @@ public sealed class Store : IDisposable
         {
             using var transaction = connection.BeginTransaction();
             using var command = connection.CreateCommand(); command.Transaction = transaction;
-            command.CommandText = "DELETE FROM events WHERE runId IN (SELECT id FROM runs WHERE taskId=$taskId); DELETE FROM runs WHERE taskId=$taskId;";
+            command.CommandText = "DELETE FROM events WHERE runId IN (SELECT id FROM runs WHERE taskId=$taskId); DELETE FROM runs WHERE taskId=$taskId; DELETE FROM task_state WHERE taskId=$taskId;";
             command.Parameters.AddWithValue("$taskId", taskId);
             command.ExecuteNonQuery();
             transaction.Commit();
+        }
+    }
+    public TaskState? LoadTaskState(string taskId)
+    {
+        lock (gate)
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = "SELECT mode,sessionJson,updatedAt FROM task_state WHERE taskId=$taskId";
+            command.Parameters.AddWithValue("$taskId", taskId);
+            using var reader = command.ExecuteReader();
+            return reader.Read()
+                ? new TaskState(taskId, reader.GetString(0), reader.IsDBNull(1) ? null : reader.GetString(1), reader.GetString(2))
+                : null;
+        }
+    }
+    public void SaveTaskState(string taskId, string mode, string? sessionJson)
+    {
+        if (mode is not ("plan" or "execute"))
+            throw new InvalidOperationException("任务模式必须是 plan 或 execute。");
+        lock (gate)
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = "INSERT INTO task_state(taskId,mode,sessionJson,updatedAt) VALUES($taskId,$mode,$sessionJson,$updatedAt) ON CONFLICT(taskId) DO UPDATE SET mode=$mode,sessionJson=$sessionJson,updatedAt=$updatedAt";
+            command.Parameters.AddWithValue("$taskId", taskId);
+            command.Parameters.AddWithValue("$mode", mode);
+            command.Parameters.AddWithValue("$sessionJson", (object?)sessionJson ?? DBNull.Value);
+            command.Parameters.AddWithValue("$updatedAt", DateTimeOffset.UtcNow.ToString("O"));
+            command.ExecuteNonQuery();
         }
     }
     public List<RunRow> History(int limit = 200, int offset = 0)
@@ -100,3 +128,4 @@ public sealed class Store : IDisposable
 
 public sealed record RunRow(string Id, string TaskId, string? ParentId, string Kind, string Workspace, string Prompt, string Provider, string Status, string Created);
 public sealed record StoredEvent(string RunId, long Sequence, string Type, string Timestamp, JsonElement Payload);
+public sealed record TaskState(string TaskId, string Mode, string? SessionJson, string UpdatedAt);

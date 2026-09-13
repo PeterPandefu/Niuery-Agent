@@ -9,15 +9,19 @@
     "start": "electron .",
     "dev": "vite --host 127.0.0.1",
     "test:desktop": "node scripts/smoke.cjs",
-    "test:conversation": "node scripts/conversation.cjs"
+    "test:conversation": "node scripts/conversation.cjs",
+    "test:project-continuation": "node scripts/project-continuation.cjs"
   },
   "dependencies": {
     "@monaco-editor/react": "4.7.0",
     "@xterm/xterm": "5.5.0",
     "lucide-react": "0.468.0",
+    "mermaid": "^11.12.1",
     "monaco-editor": "0.52.2",
     "react": "19.0.0",
-    "react-dom": "19.0.0"
+    "react-dom": "19.0.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@types/node": "22.10.2",

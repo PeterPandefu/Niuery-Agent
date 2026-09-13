@@ -1,4 +1,5 @@
 using System.Text;
+using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
 using Niuery.Agent.Runtime.Maf;
 using Xunit;
@@ -7,6 +8,20 @@ namespace Niuery.Agent.Runtime.Tests;
 
 public sealed class HarnessTests
 {
+    [Fact(DisplayName = "编码 Harness 默认使用计划模式并支持切换")]
+    public async Task CodingHarnessUsesPlanModeByDefault()
+    {
+        using var client = new ScriptedChatClient();
+        var agent = HarnessFactory.CreateCoding(client, []);
+        var session = await agent.CreateSessionAsync();
+        var provider = agent.GetService<AgentModeProvider>();
+
+        Assert.NotNull(provider);
+        Assert.Equal("plan", await provider!.GetModeAsync(session));
+        await provider.SetModeAsync(session, "execute");
+        Assert.Equal("execute", await provider.GetModeAsync(session));
+    }
+
     [Fact(DisplayName = "MAF 流式循环执行真实本地函数并将结果传回模型接口")]
     public async Task StreamingInvokesToolAndReturnsResult()
     {

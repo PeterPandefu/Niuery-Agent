@@ -1,5 +1,8 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import mermaid from "mermaid";
 import {
   Activity,
   AlertTriangle,
@@ -23,6 +26,7 @@ import {
   RotateCcw,
   Settings2,
   ShieldCheck,
+  SlidersHorizontal,
   SquareTerminal,
   Trash2,
   X,
@@ -44,6 +48,7 @@ type Run = {
   kind?: "project" | "chat";
   taskTitle?: string;
 };
+type AgentMode = "plan" | "execute";
 type Project = { id: string; path: string; name: string; isGit?: boolean };
 type Event = {
   runId: string;
@@ -117,7 +122,24 @@ const eventText: Record<string, string> = {
   "approval.resolved": "审批已处理",
   "command.completed": "命令执行完成",
   "command.failed": "命令执行失败",
+  "mode.changed": "运行模式已切换",
+  "session.restored": "已恢复任务会话",
+  "session.restore.failed": "任务会话恢复失败，已创建新会话",
+  "session.save.failed": "任务状态保存失败",
 };
+
+function timelineEventsForRun(events: Event[], runId: string) {
+  return events.filter((event) =>
+    event.runId === runId &&
+    event.type !== "message.delta" &&
+    event.type !== "approval.requested" &&
+    event.type !== "approval.resolved",
+  );
+}
+
+function timelineEventLabel(event: Event) {
+  return event.payload.message || eventText[event.type] || event.type;
+}
 
 function eventOutput(event: Event) {
   if (event.type === "command.completed") {
@@ -182,6 +204,77 @@ function ThinkingIndicator() {
   );
 }
 
+let mermaidDiagramCounter = 0;
+
+function MermaidDiagram({ chart }: { chart: string }) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const diagramId = useMemo(() => `mermaid-diagram-${++mermaidDiagramCounter}`, []);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    setError("");
+    mermaid.initialize({
+      startOnLoad: false,
+      securityLevel: "strict",
+      theme: "base",
+    });
+    mermaid
+      .render(diagramId, chart)
+      .then(({ svg, bindFunctions }) => {
+        if (cancelled || !containerRef.current) return;
+        containerRef.current.innerHTML = svg;
+        bindFunctions?.(containerRef.current);
+      })
+      .catch((reason: unknown) => {
+        if (cancelled) return;
+        if (containerRef.current) containerRef.current.innerHTML = "";
+        setError(reason instanceof Error ? reason.message : "图表语法无法解析。");
+      });
+    return () => {
+      cancelled = true;
+      if (containerRef.current) containerRef.current.innerHTML = "";
+    };
+  }, [chart, diagramId]);
+
+  return (
+    <div className="mermaid-block">
+      <div ref={containerRef} className="mermaid-diagram" role="img" aria-label="Mermaid 图表" />
+      {error && (
+        <details className="mermaid-error">
+          <summary>Mermaid 图表渲染失败</summary>
+          <p>{error}</p>
+          <pre><code>{chart}</code></pre>
+        </details>
+      )}
+    </div>
+  );
+}
+
+type MarkdownCodeProps = React.ComponentPropsWithoutRef<"code"> & { node?: unknown };
+
+function MarkdownCode({ className, children, ...props }: MarkdownCodeProps) {
+  const language = /language-(\w+)/.exec(className || "")?.[1].toLowerCase();
+  if (language === "mermaid") {
+    return <MermaidDiagram chart={String(children).replace(/\n$/, "")} />;
+  }
+  return <code className={className} {...props}>{children}</code>;
+}
+
+function MarkdownPre({ children }: React.ComponentPropsWithoutRef<"pre">) {
+  const child = React.Children.toArray(children)[0];
+  if (React.isValidElement(child) && child.type === MermaidDiagram) return child;
+  return <pre>{children}</pre>;
+}
+
+function MarkdownAnswer({ content }: { content: string }) {
+  return (
+    <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ code: MarkdownCode, pre: MarkdownPre }}>
+      {content}
+    </ReactMarkdown>
+  );
+}
+
 function App() {
   const [runs, setRuns] = useState<Run[]>([]),
     [providers, setProviders] = useState<Provider[]>([]),
@@ -200,6 +293,7 @@ function App() {
   });
   const [activeProjectId, setActiveProjectId] = useState(() => localStorage.getItem("activeProjectId") || "");
   const [composeKind, setComposeKind] = useState<"project" | "chat">("project");
+  const [workMode, setWorkMode] = useState<AgentMode>("plan");
   const [contextMenu, setContextMenu] = useState<{ taskId: string; x: number; y: number } | null>(null);
   const [projectToRemove, setProjectToRemove] = useState<Project | null>(null);
   const [keyframeHoverIndex, setKeyframeHoverIndex] = useState<number | null>(null);
@@ -210,6 +304,7 @@ function App() {
     [rightOpen, setRightOpen] = useState(true),
     [rightTab, setRightTab] = useState<"diff" | "activity">("diff"),
     [expanded, setExpanded] = useState<Record<string, boolean>>({}),
+    [timelineExpanded, setTimelineExpanded] = useState<Record<string, boolean>>({}),
     [customProviders, setCustomProviders] = useState<Provider[]>([]),
     [settingsProviderId, setSettingsProviderId] = useState(""),
     [selectedModel, setSelectedModel] = useState(""),
@@ -292,8 +387,18 @@ function App() {
   }, [selected, runs.length]);
   const current = runs.find((r) => r.id === selected),
     running = runs.some((r) => r.status === "running"),
+    canContinue = !!current && (current.status === "completed" || current.status === "interrupted"),
     projectName =
       workspace.split(/[\\/]/).filter(Boolean).pop() || "未选择项目";
+  useEffect(() => {
+    if (!current) {
+      setWorkMode("plan");
+      return;
+    }
+    window.agent.request("mode.get", { taskId: current.taskId })
+      .then((result: { mode?: AgentMode }) => setWorkMode(result.mode === "execute" ? "execute" : "plan"))
+      .catch((e: Error) => setError(e.message));
+  }, [current?.taskId]);
   const taskRuns = useMemo(() => {
     const latest = new Map<string, Run>();
     const first = new Map<string, Run>();
@@ -372,6 +477,7 @@ function App() {
         providerId: provider,
         model: selectedModel,
         prompt: prompt.trim(),
+        mode: workMode,
       });
       setSelected(run.id);
       setPrompt("");
@@ -385,10 +491,24 @@ function App() {
   }
   function newProjectTask(project: Project) {
     setWorkspace(project.path); localStorage.setItem("workspace", project.path);
-    setActiveProjectId(project.id); setComposeKind("project"); setSelected(null); setPrompt("");
+    setActiveProjectId(project.id); setComposeKind("project"); setSelected(null); setPrompt(""); setWorkMode("plan");
   }
   function newChatTask() {
-    setComposeKind("chat"); setSelected(null); setPrompt(""); setWorkspace("");
+    setComposeKind("chat"); setSelected(null); setPrompt(""); setWorkspace(""); setWorkMode("plan");
+  }
+  function selectComposeKind(kind: "project" | "chat") {
+    if (kind === composeKind) return;
+    setComposeKind(kind);
+    setSelected(null);
+    if (kind === "chat") {
+      setWorkspace("");
+      return;
+    }
+    const activeProject = projects.find((project) => project.id === activeProjectId);
+    if (activeProject) {
+      setWorkspace(activeProject.path);
+      localStorage.setItem("workspace", activeProject.path);
+    }
   }
   function removeProject(project: Project) {
     setProjects((old) => old.filter((p) => p.id !== project.id));
@@ -396,7 +516,7 @@ function App() {
     setProjectToRemove(null);
   }
   async function continueTask() {
-    if (!current || (composeKind !== "chat" && current.status !== "interrupted") || !prompt.trim()) return;
+    if (!current || !canContinue || !prompt.trim()) return;
     setBusy(true);
     stickConversationToBottom.current = true;
     setError("");
@@ -405,6 +525,44 @@ function App() {
         runId: current.id,
         model: selectedModel,
         prompt: prompt.trim(),
+        mode: workMode,
+        ...(composeKind === "chat" && workspace ? { workspace } : {}),
+      });
+      setSelected(run.id);
+      setPrompt("");
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function setTaskMode(nextMode: AgentMode) {
+    if (!current) {
+      setWorkMode(nextMode);
+      return;
+    }
+    if (running) return;
+    try {
+      await window.agent.request("mode.set", { taskId: current.taskId, mode: nextMode });
+      setWorkMode(nextMode);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+  async function approveAndExecute() {
+    if (!current || !canContinue || workMode !== "plan") return;
+    setBusy(true);
+    stickConversationToBottom.current = true;
+    setError("");
+    try {
+      await window.agent.request("mode.set", { taskId: current.taskId, mode: "execute" });
+      setWorkMode("execute");
+      const run = await window.agent.request("run.continue", {
+        runId: current.id,
+        model: selectedModel,
+        mode: "execute",
+        prompt: prompt.trim() || "请按照已批准的计划开始执行。",
         ...(composeKind === "chat" && workspace ? { workspace } : {}),
       });
       setSelected(run.id);
@@ -729,6 +887,9 @@ function App() {
                 <span className={`status-chip ${current.status}`}>
                   {statusIcon[current.status]} {statusText[current.status]}
                 </span>
+                <span className={`mode-badge ${workMode}`}>
+                  {workMode === "plan" ? "计划模式" : "执行模式"}
+                </span>
                 <span>
                   {providers.find((p) => p.id === current.provider)?.model ||
                     current.provider}
@@ -741,7 +902,13 @@ function App() {
                   <PanelRight size={14} /> {rightOpen ? "收起成果" : "查看成果"}
                 </button>
               </div>
-              {conversationTurns.map(({ run, output: turnOutput }, index) => (
+              {conversationTurns.map(({ run, output: turnOutput }, index) => {
+                const timelineEvents = timelineEventsForRun(events, run.id);
+                const latestTimelineAction = timelineEvents.length > 0
+                  ? timelineEventLabel(timelineEvents[timelineEvents.length - 1])
+                  : "暂无执行动作";
+                const isTimelineExpanded = timelineExpanded[run.id] ?? false;
+                return (
                 <div className="conversation-turn" id={`turn-${run.id}`} key={run.id}>
                   <div className="user-prompt">
                     <span className="prompt-label">你的问题</span>
@@ -752,24 +919,46 @@ function App() {
                       <div className="message-avatar">N</div>
                       <div>
                         <span className="message-label">Agent</span>
-                        <div className="answer">{turnOutput}</div>
+                        <div className="answer">
+                          <MarkdownAnswer content={turnOutput} />
+                        </div>
                       </div>
                     </div>
                   ) : index === conversationTurns.length - 1 && run.status === "running" ? (
                     <ThinkingIndicator />
                   ) : null}
                   <div className="turn-timeline">
-                    <div className="timeline-title"><History size={14} /> 执行记录</div>
-                    {events.filter((event) => event.runId === run.id && event.type !== "message.delta" && event.type !== "approval.requested" && event.type !== "approval.resolved").map((event) => (
-                      <div className="timeline-item" key={`${event.runId}-${event.sequence}`}>
-                        <span className={`timeline-dot ${event.type.startsWith("run.") ? run.status : ""}`}>{event.type.startsWith("run.") ? statusIcon[run.status] : <Activity size={12} />}</span>
-                        <span>{event.payload.message || eventText[event.type] || event.type}</span>
-                        <time>{new Date(event.timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</time>
+                    <button
+                      className="timeline-title"
+                      type="button"
+                      aria-expanded={isTimelineExpanded}
+                      aria-controls={`timeline-${run.id}`}
+                      title={isTimelineExpanded ? "收起执行记录" : `最新执行动作：${latestTimelineAction}`}
+                      onClick={() => setTimelineExpanded((current) => ({
+                        ...current,
+                        [run.id]: !isTimelineExpanded,
+                      }))}
+                    >
+                      {isTimelineExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                      <History size={14} />
+                      <span>执行记录</span>
+                      {!isTimelineExpanded && <span className="timeline-latest" title={latestTimelineAction}>{latestTimelineAction}</span>}
+                    </button>
+                    {isTimelineExpanded && (
+                      <div id={`timeline-${run.id}`}>
+                        {timelineEvents.map((event) => (
+                          <div className="timeline-item" key={`${event.runId}-${event.sequence}`}>
+                            <span className={`timeline-dot ${event.type.startsWith("run.") ? run.status : ""}`}>{event.type.startsWith("run.") ? statusIcon[run.status] : <Activity size={12} />}</span>
+                            <span>{timelineEventLabel(event)}</span>
+                            <time>{new Date(event.timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</time>
+                          </div>
+                        ))}
                       </div>
-                    ))}
+                    )}
                   </div>
                 </div>
-              ))}
+                );
+              })}
               {approvals.map((approval) => (
                 <div className="approval-card" key={approval.approvalId}>
                   <div className="approval-icon">
@@ -845,7 +1034,32 @@ function App() {
                   current ? continueTask() : start();
               }}
             />
-            <div className="composer-toolbar">
+              <div className="composer-toolbar">
+                <label className="mode-select">
+                <SlidersHorizontal size={14} />
+                <select
+                  aria-label="工作模式"
+                  title="选择 MAF 工作模式"
+                  value={composeKind}
+                  onChange={(e) => selectComposeKind(e.target.value as "project" | "chat")}
+                >
+                  <option value="project">编码模式</option>
+                  <option value="chat">Chat 模式</option>
+                </select>
+                </label>
+                <label className="mode-select">
+                  <SlidersHorizontal size={14} />
+                  <select
+                    aria-label="Agent 模式"
+                    title="选择 Agent 计划或执行模式"
+                    value={workMode}
+                    disabled={running || busy}
+                    onChange={(e) => void setTaskMode(e.target.value as AgentMode)}
+                  >
+                    <option value="plan">计划模式</option>
+                    <option value="execute">执行模式</option>
+                  </select>
+                </label>
               <label className="model-select">
                 <Settings2 size={14} />
                 <select
@@ -863,10 +1077,20 @@ function App() {
                   ? "Chat 对话 · Ctrl + Enter 发送"
                   : !workspace
                   ? "先选择一个项目"
-                  : current && current.status !== "interrupted"
-                    ? "只有中断的任务可以继续"
+                  : current && !canContinue
+                    ? "只有已完成或中断的任务可以继续"
                     : "Ctrl + Enter 发送"}
               </span>
+              {current && workMode === "plan" && canContinue && !running && (
+                <button
+                  className="approve-button"
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void approveAndExecute()}
+                >
+                  <Check size={13} /> 批准并执行
+                </button>
+              )}
               {running ? (
                 <button
                   className="send-button stop"
@@ -883,7 +1107,7 @@ function App() {
                 <button
                   className="send-button"
                   aria-label={current ? (composeKind === "chat" ? "继续对话" : "继续执行") : "开始执行"}
-                  disabled={busy || (composeKind !== "chat" && !workspace) || !prompt.trim() || !provider || (!!current && composeKind !== "chat" && current.status !== "interrupted")}
+                  disabled={busy || (composeKind !== "chat" && !workspace) || !prompt.trim() || !provider || (!!current && !canContinue)}
                   onClick={current ? continueTask : start}
                 >
                   <ArrowUp size={18} />
