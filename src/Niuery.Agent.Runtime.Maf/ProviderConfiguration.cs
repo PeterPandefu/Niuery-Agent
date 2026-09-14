@@ -56,9 +56,20 @@ public sealed record ProviderConfiguration(
         return ApiKey!;
     }
 
+    public static async Task<IReadOnlyList<ProviderConfiguration>> LoadOrEmptyAsync(string path, CancellationToken cancellationToken = default)
+        => File.Exists(path) ? await LoadAsync(path, cancellationToken) : Array.Empty<ProviderConfiguration>();
+
     public static async Task<IReadOnlyList<ProviderConfiguration>> LoadAsync(string path, CancellationToken cancellationToken = default)
     {
-        var json = await File.ReadAllTextAsync(path, cancellationToken);
+        string json;
+        try
+        {
+            json = await File.ReadAllTextAsync(path, cancellationToken);
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            throw new ConfigurationException("找不到模型配置文件。");
+        }
         var document = JsonSerializer.Deserialize<ProviderFile>(json, new JsonSerializerOptions(JsonSerializerDefaults.Web)
         {
             UnmappedMemberHandling = System.Text.Json.Serialization.JsonUnmappedMemberHandling.Disallow

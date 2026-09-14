@@ -7,7 +7,7 @@ Console.InputEncoding = Encoding.UTF8; Console.OutputEncoding = new UTF8Encoding
 if (args.Length != 2) { Console.Error.WriteLine("用法：执行器 <模型配置文件> <数据库路径>"); return 2; }
 try
 {
-    var providers = await ProviderConfiguration.LoadAsync(args[0]);
+    var providers = await ProviderConfiguration.LoadOrEmptyAsync(args[0]);
     using var store = new Store(args[1]);
     await using var host = new WorkerHost(store, providers, args[0]);
     while (await Console.In.ReadLineAsync() is { } line)
@@ -34,4 +34,5 @@ try
     }
     return 0;
 }
+catch (ConfigurationException ex) { Console.Error.WriteLine(ex.Message); return 1; }
 catch (Exception) { Console.Error.WriteLine("执行器启动失败，请检查模型配置和数据库权限。"); return 1; }

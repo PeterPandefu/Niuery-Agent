@@ -44,4 +44,21 @@ public sealed class ProviderConfigurationTests
         using var client = HarnessFactory.CreateClient(config);
         Assert.NotNull(client);
     }
+
+    [Fact(DisplayName = "缺少配置文件时探测给出中文错误且不泄露路径")]
+    public async Task MissingFileThrowsChinese()
+    {
+        var path = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"), "providers.local.json");
+        var error = await Assert.ThrowsAsync<ConfigurationException>(() => ProviderConfiguration.LoadAsync(path));
+        Assert.Contains("找不到模型配置文件", error.Message);
+        Assert.DoesNotContain(path, error.Message);
+    }
+
+    [Fact(DisplayName = "缺少配置文件时执行器按空列表启动")]
+    public async Task MissingFileLoadsAsEmptyForWorker()
+    {
+        var path = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"), "providers.local.json");
+        var providers = await ProviderConfiguration.LoadOrEmptyAsync(path);
+        Assert.Empty(providers);
+    }
 }
