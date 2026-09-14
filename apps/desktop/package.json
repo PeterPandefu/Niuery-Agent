@@ -5,7 +5,7 @@
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
-    "build": "tsc --noEmit && vite build",
+    "build": "node scripts/ensure-deps.cjs && tsc --noEmit && vite build",
     "start": "electron .",
     "dev": "vite --host 127.0.0.1",
     "test:desktop": "node scripts/smoke.cjs",
